@@ -5,7 +5,7 @@ import { PortfolioClient, type PatchAd } from "../src/portfolio/client";
 import { EarningsClient } from "../src/earnings/client";
 
 const AD: PatchAd = {
-  adId: "ad-1", campaignId: "c-1", seat: "s", adText: "Ramp - 30% faster",
+  adId: "ad-1", campaignId: "c-1", adText: "Ramp - 30% faster",
   iconRef: "ramp", iconUrl: "", clickUrl: "https://ramp.com", bannerEnabled: false,
   sessionToken: "test-token",
 };
@@ -13,7 +13,8 @@ const AD: PatchAd = {
 function buildSuite(opts: { ad?: PatchAd | null;
                             signedIn?: boolean;
                             killed?: boolean;
-                            viewThresholdMs?: number } = {}) {
+                            viewThresholdMs?: number;
+                            onBillableEvent?: () => void } = {}) {
   const calls: { url: string; body: Record<string, unknown>;
                  hdr: Record<string, string> }[] = [];
   const fakeFetch = vi.fn(async (url: string, init: { body: string;
@@ -35,7 +36,8 @@ function buildSuite(opts: { ad?: PatchAd | null;
     viewThresholdMs: opts.viewThresholdMs ?? 15000,
     loopback: { port: 12345, base: "http://127.0.0.1:12345/vibe-ads/tok" },
   };
-  const hooks = new TestHooks(metrics, portfolio, earnings, () => ctx);
+  const hooks = new TestHooks(metrics, portfolio, earnings, () => ctx,
+    opts.onBillableEvent ?? null);
   return { hooks, calls, fakeFetch, ctx };
 }
 
@@ -153,9 +155,23 @@ describe("TestHooks", () => {
       expect(calls.every((c) => c.body.event_type === "view_tick")).toBe(true);
     });
 
+  it("schedules earnings refresh after successful billable test-hook events",
+    async () => {
+      const onBillableEvent = vi.fn();
+      const { hooks } = buildSuite({ onBillableEvent });
+      await hooks.fireImpressionRendered();
+      await hooks.fireViewTick();
+      expect(onBillableEvent).not.toHaveBeenCalled();
+      await hooks.fireImpressionViewable();
+      await hooks.fireViewThresholdMet();
+      await hooks.fireErrorImpression();
+      await hooks.fireClick();
+      expect(onBillableEvent).toHaveBeenCalledTimes(4);
+    });
+
   it("refreshPortfolio calls PortfolioClient.fetchPortfolio with ccVersion"
     + " and surfaces the new ad", async () => {
-    const ad2: PatchAd = { adId: "ad-2", campaignId: "c-2", seat: "s",
+    const ad2: PatchAd = { adId: "ad-2", campaignId: "c-2",
       adText: "New ad text", iconRef: "x", iconUrl: "", clickUrl: "https://x", bannerEnabled: false,
       sessionToken: "test-token-2" };
     // Override fetch on the suite to return a portfolio body with ad2.

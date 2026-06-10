@@ -1,6 +1,7 @@
-import { createHash, createVerify } from "node:crypto";
+import { createHash, verify } from "node:crypto";
 import { dlog } from "../log";
 import { errMsg } from "../util/errMsg";
+import { timeoutFetch } from "../util/http";
 
 type Fetch = typeof fetch;
 type Installer = (vsix: ArrayBuffer) => Promise<void>;
@@ -86,11 +87,41 @@ function _verifyManifestSignature(
 ): boolean {
   if (!m.signature) return false;
   try {
-    const v = createVerify("SHA256");
-    v.update(`${m.version}\n${m.sha256}\n${m.url}`);
-    v.end();
-    return v.verify(pubkeyPem, Buffer.from(m.signature, "base64"));
+    return verify(
+      null,
+      Buffer.from(`${m.version}\n${m.sha256}\n${m.url}`),
+      pubkeyPem,
+      Buffer.from(m.signature, "base64"),
+    );
   } catch { return false; }
+}
+
+// wave-2A-F01 layer 3 — VSIX download-origin pin. The sha256 above proves the
+// downloaded bytes match the manifest, but a compromised manifest controls
+// BOTH `url` AND `sha256`, so on its own the pin can be redirected to an
+// attacker-controlled host (supply-chain RCE on every install). Restrict the
+// download origin to the published `kickbacks-vsix` GCS bucket in production,
+// while still allowing a self-hosted DEV manifest to serve the VSIX from its
+// OWN origin (same host as `base`) or loopback — if an attacker can MITM that
+// they already control the manifest + sha, so it grants no new capability. An
+// out-of-allowlist url is rejected BEFORE the fetch (safe-degraded: the
+// self-update no-ops rather than fetching/installing an untrusted artifact).
+export function _vsixUrlAllowed(rawUrl: string, base: string): boolean {
+  let u: URL;
+  try { u = new URL(rawUrl); } catch { return false; }
+  const host = u.hostname.toLowerCase();
+  // Dev / self-host escape hatches.
+  if (host === "localhost" || host === "127.0.0.1" || host === "::1") return true;
+  try {
+    if (host === new URL(base).hostname.toLowerCase()) return true;
+  } catch { /* base isn't a URL — fall through to the prod allowlist */ }
+  // Production: HTTPS to the published kickbacks-vsix GCS bucket only.
+  if (u.protocol !== "https:") return false;
+  if (host === "kickbacks-vsix.storage.googleapis.com") return true;
+  if (host === "kickbacks-vsix.storage.cloud.google.com") return true;
+  if ((host === "storage.googleapis.com" || host === "storage.cloud.google.com")
+      && u.pathname.startsWith("/kickbacks-vsix/")) return true;
+  return false;
 }
 
 /** Polls /v1/ext/manifest; sha256-verifies the VSIX before install. Returns
@@ -112,7 +143,7 @@ export class UpdateClient {
                                        current: string;
                                        rollback: boolean }) => void;
   constructor(private base: string, private current: string,
-              private f: Fetch = fetch, private install: Installer = async () => {},
+              private f: Fetch = timeoutFetch(120000), private install: Installer = async () => {},
               private guard?: AttemptGuard,
               onUpdateAvailable?: (info: { version: string;
                                             current: string;
@@ -130,7 +161,23 @@ export class UpdateClient {
     return false;
   }
 
+  // audit-2026-06-09 #31: single-flight guard. checkOnce is driven by a
+  // fire-and-forget 90s setInterval (selfUpdate.ts); the attempt fence is
+  // only written AFTER the download completes (markAttempted below), so a
+  // VSIX download slower than the poll period let the next tick re-enter,
+  // double-download and double-install the same artifact. An overlapping
+  // poll now returns false immediately; cooldown/attempt-guard semantics
+  // for SEQUENTIAL polls are unchanged.
+  private inFlight = false;
+
   async checkOnce(): Promise<boolean> {
+    if (this.inFlight) return false;
+    this.inFlight = true;
+    try { return await this.checkOnceInner(); }
+    finally { this.inFlight = false; }
+  }
+
+  private async checkOnceInner(): Promise<boolean> {
     try {
       const m = await (await this.f(`${this.base}/v1/ext/manifest`)).json() as
         { version: string; sha256: string; url: string; signature?: string;
@@ -156,10 +203,11 @@ export class UpdateClient {
       // would otherwise burn bandwidth + CPU every 90s indefinitely.
       if (this.guard?.transientFailed?.(m.version, m.sha256)) return false;
       // wave-2A-F01: flag-gated manifest signature verification.
-      const requireSig = process.env.KICKBACKS_REQUIRE_MANIFEST_SIG === "1"
+      const pubkey = _embeddedPubkeyPem();
+      const requireSig = !!pubkey
+        || process.env.KICKBACKS_REQUIRE_MANIFEST_SIG === "1"
         || process.env.VIBE_ADS_REQUIRE_MANIFEST_SIG === "1";
       if (requireSig) {
-        const pubkey = _embeddedPubkeyPem();
         if (!pubkey) {                          // flag on but no embedded key
           this.guard?.markTransientFailed?.(m.version, m.sha256);
           return this.noteFail("missing-pubkey", { version: m.version });
@@ -168,6 +216,13 @@ export class UpdateClient {
           this.guard?.markTransientFailed?.(m.version, m.sha256);
           return this.noteFail("sig-verify", { version: m.version });
         }
+      }
+      // Supply-chain pin: never fetch a VSIX from an origin outside the
+      // published bucket (or a dev self-host). Transient so a later corrected
+      // manifest still recovers, but the download itself is refused here.
+      if (!_vsixUrlAllowed(m.url, this.base)) {
+        this.guard?.markTransientFailed?.(m.version, m.sha256);
+        return this.noteFail("vsix-url-blocked", { version: m.version, url: m.url });
       }
       let ab: ArrayBuffer;
       try {

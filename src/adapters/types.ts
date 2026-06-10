@@ -57,6 +57,23 @@ export interface PatchParams {
   viewThresholdMs?: number;
 }
 
+/** Ground-truth snapshot for the `Kickbacks: Diagnose` command — everything
+ *  needed to tell a cosmetic flash from a real miss without reading the bundle
+ *  by hand. `bareVerbPresent` is the key tell: a verb word exists in the live
+ *  file but `hasArray` is false ⇒ the bundle format changed (fix the regex);
+ *  neither present ⇒ the file was stripped/corrupted (reinstall Claude Code). */
+export interface AdapterDiagnostics {
+  name: string;
+  target: string;
+  targetExists: boolean;
+  version: string | null;
+  compatible: boolean;
+  reason?: string;
+  isPatched: boolean;
+  backup: { exists: boolean; path: string | null; hasArray: boolean; hasBlock: boolean };
+  live: { hasArray: boolean; bareVerbPresent: boolean };
+}
+
 /** A patch target (Claude Code now; Codex later). All methods are
  *  absolute-path, never-throw, and return typed results. */
 export interface TargetAdapter {
@@ -73,6 +90,9 @@ export interface TargetAdapter {
    *  only does work when the patch actually drifted (CC overwrite / fresh
    *  load). Optional: adapters without a meaningful notion may omit it. */
   isPatched?(): boolean;
+  /** Ground-truth diagnostics for the user-facing diagnose command. Optional:
+   *  adapters that don't implement it are simply summarised by preflight(). */
+  diagnose?(): AdapterDiagnostics;
   /** Apply ONLY the invisible structural relaxation the loopback needs (the
    *  connect-src CSP insertion on the sibling extension.js) WITHOUT injecting
    *  any ad block. Lets activation prime the surface on every boot — even when

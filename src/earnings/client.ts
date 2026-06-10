@@ -1,3 +1,5 @@
+import { timeoutFetch } from "../util/http";
+
 type Fetch = typeof fetch;
 
 export interface Earnings { lifetimeUsd: string; todayUsd: string; }
@@ -13,26 +15,49 @@ export type EarningsAuthRecovery = () => Promise<boolean>;
  *  for the status bar. Fail-safe: any error / signed-out => null; the status
  *  bar then renders $0.00 (it never shows a bare label and never throws). */
 export class EarningsClient {
+  private f: Fetch;
   constructor(private base: string, private token: () => string | null,
-              private f: Fetch = fetch,
-              private onAuth401: EarningsAuthRecovery | null = null) {}
+              f: Fetch = timeoutFetch(15000),
+              private onAuth401: EarningsAuthRecovery | null = null) {
+    // audit-2026-06-09 #38: extension.ts passes bare global `fetch`
+    // positionally (only to reach the onAuth401 arg), silently bypassing
+    // the timeout default above. Re-wrap that one case so a black-holed
+    // connection still aborts; injected test/custom fetches are untouched.
+    this.f = f === globalThis.fetch ? timeoutFetch(15000) : f;
+  }
 
   async fetch(): Promise<Earnings | null> {
+    const r = await this.fetchDetailed();
+    return r.outcome === "ok" ? r.earnings : null;
+  }
+
+  /** audit-2026-06-09 #34: like fetch() but preserves the failure KIND so
+   *  callers can distinguish a real backend 401 (session expired) from a
+   *  transient network / 5xx / malformed-body failure. "401" is only
+   *  reported when the backend actually said 401 AND the one-shot
+   *  refresh-retry did not recover (no recovery hook, refresh failed, or
+   *  the retry 401'd again). */
+  async fetchDetailed(): Promise<
+    { outcome: "ok"; earnings: Earnings }
+    | { outcome: "401" | "error" }
+  > {
     try {
       const first = await this.fetchOnce();
-      if (first.outcome === "ok") return first.earnings;
+      if (first.outcome === "ok") return first;
       // 401 path: refresh once + retry. Any other failure (network,
-      // 5xx, malformed body) returns null without retry — fail-fast on
+      // 5xx, malformed body) reports "error" without retry — fail-fast on
       // structural problems so the caller's `lastUsd` cache holds.
-      if (first.outcome === "401" && this.onAuth401) {
-        const refreshed = await this.onAuth401();
-        if (refreshed) {
+      if (first.outcome === "401") {
+        if (this.onAuth401 && await this.onAuth401()) {
+          // A transient failure on the retry is NOT a session expiry —
+          // the refresh itself just succeeded, so pass `second` through.
           const second = await this.fetchOnce();
-          if (second.outcome === "ok") return second.earnings;
+          return second;
         }
+        return { outcome: "401" };
       }
-      return null;
-    } catch { return null; }
+      return { outcome: "error" };
+    } catch { return { outcome: "error" }; }
   }
 
   private async fetchOnce(): Promise<

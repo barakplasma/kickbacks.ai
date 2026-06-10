@@ -11,7 +11,7 @@ import { MetricsClient } from "../src/metrics/client";
 import { PortfolioClient, type PatchAd } from "../src/portfolio/client";
 import { EarningsClient } from "../src/earnings/client";
 
-const AD: PatchAd = { adId: "ad-route", campaignId: "c-route", seat: "s",
+const AD: PatchAd = { adId: "ad-route", campaignId: "c-route",
   adText: "x", iconRef: "i", iconUrl: "", clickUrl: "https://x", bannerEnabled: false,
   sessionToken: "test-token" };
 

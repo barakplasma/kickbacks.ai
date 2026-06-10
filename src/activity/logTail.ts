@@ -16,11 +16,51 @@ export interface Activity {
  *  injected block self-simulates. NEVER throws. The format is version-fragile
  *  and deliberately non-load-bearing (spec §4.5) — the S5 matrix flags drift. */
 const IDLE_STALE_MS = 90_000;
+/** Min gap between resolver re-runs while the pinned file sits idle-stale, so
+ *  a simply-idle user doesn't re-glob the transcript tree on every poll. */
+const RERESOLVE_MIN_MS = 15_000;
 
 export class LogTail {
   private firstSeen = Date.now();
   private lastTool = "";
-  constructor(private readonly path: string) {}
+  private path: string;
+  private lastReresolveAt = 0;
+  private readonly resolvePath?: () => string;
+
+  constructor(pathOrResolver: string | (() => string)) {
+    if (typeof pathOrResolver === "function") {
+      this.path = "";
+      this.resolvePath = pathOrResolver;
+    } else {
+      this.path = pathOrResolver;
+    }
+  }
+
+  private currentPath(): string {
+    try {
+      if (this.path && existsSync(this.path)) {
+        if (!this.resolvePath) return this.path;
+        // Transcripts are never deleted: a NEW chat session writes a NEW
+        // .jsonl while the pinned one just goes quiet. Once the pinned file
+        // is idle-stale, re-resolve (throttled) and adopt any newer
+        // transcript — otherwise the pin is forever (audit #2: dead statusbar
+        // ad, overlay txnIdle suppression, blind desync watchdog).
+        const age = Date.now() - statSync(this.path).mtimeMs;
+        if (age <= IDLE_STALE_MS) return this.path;
+        if (Date.now() - this.lastReresolveAt < RERESOLVE_MIN_MS) {
+          return this.path;
+        }
+        this.lastReresolveAt = Date.now();
+      }
+      const next = this.resolvePath?.() || "";
+      if (next && next !== this.path) {
+        this.path = next;
+        this.lastTool = "";
+        this.firstSeen = Date.now();
+      }
+      return this.path;
+    } catch { return this.path; }
+  }
 
   /** Age in ms since Claude Code last wrote its session transcript, or null
    *  when there's no readable transcript. An INDEPENDENT activity signal: it
@@ -30,23 +70,25 @@ export class LogTail {
    *  Cheaper than current() (a single stat, no read). Never throws. */
   activityAgeMs(): number | null {
     try {
-      if (!this.path || !existsSync(this.path)) return null;
+      const path = this.currentPath();
+      if (!path || !existsSync(path)) return null;
       // Clamp: a just-written file's mtime can be a hair ahead of Date.now()
       // (fs timestamp precision / clock skew), which would otherwise yield a
       // nonsensical negative age.
-      return Math.max(0, Date.now() - statSync(this.path).mtimeMs);
+      return Math.max(0, Date.now() - statSync(path).mtimeMs);
     } catch { return null; }
   }
 
   current(): Activity | null {
     try {
-      if (!this.path || !existsSync(this.path)) return null;
-      const st = statSync(this.path);
+      const path = this.currentPath();
+      if (!path || !existsSync(path)) return null;
+      const st = statSync(path);
       const size = st.size;
       const staleMs = Date.now() - st.mtimeMs;
       const want = Math.min(size, 128 * 1024);
       if (want === 0) return null;
-      const fd = openSync(this.path, "r");
+      const fd = openSync(path, "r");
       let text: string;
       try {
         const buf = Buffer.alloc(want);
@@ -61,6 +103,7 @@ export class LogTail {
 
       let tool = "";
       let done: boolean | null = null;   // null until we see an assistant line
+      let pendingUserAfterAssistant = false;
       // Walk newest → oldest: first assistant line decides `done`; first
       // tool_use block is the current/most-recent tool.
       for (let i = lines.length - 1; i >= 0; i--) {
@@ -69,11 +112,22 @@ export class LogTail {
         let o: Record<string, unknown>;
         try { o = JSON.parse(ln); } catch { continue; }
         const msg = o.message as Record<string, unknown> | undefined;
+        if (done === null && o.type === "user") {
+          pendingUserAfterAssistant = true;
+          continue;
+        }
         if (o.type === "assistant" && msg) {
           if (done === null) {
-            const sr = msg.stop_reason as string | null | undefined;
-            // Set + not "tool_use" => the turn ended (end_turn/stop_sequence).
-            done = !!sr && sr !== "tool_use";
+            if (pendingUserAfterAssistant) {
+              // A fresh user prompt after the latest assistant line means the
+              // next assistant response has not landed yet. Treat it as active
+              // instead of inheriting the prior completed turn.
+              done = false;
+            } else {
+              const sr = msg.stop_reason as string | null | undefined;
+              // Set + not "tool_use" => the turn ended (end_turn/stop_sequence).
+              done = !!sr && sr !== "tool_use";
+            }
           }
           if (!tool && Array.isArray(msg.content)) {
             for (const b of msg.content as Array<Record<string, unknown>>) {
@@ -86,6 +140,7 @@ export class LogTail {
         if (tool && done !== null) break;
       }
 
+      if (done === null && pendingUserAfterAssistant) done = false;
       if (!tool && done === null) return null;   // nothing usable in the tail
       if (tool && tool !== this.lastTool) {
         this.lastTool = tool; this.firstSeen = Date.now();

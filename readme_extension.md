@@ -1,10 +1,11 @@
 <h1 align="center">Kickbacks</h1>
 
-<p align="center"><em>Get paid while you code. Half of every ad dollar goes to you.</em></p>
+<p align="center"><em>Get paid while you code. Earn up to 50% of ad revenue.</em></p>
 
 <p align="center">
   <a href="https://kickbacks.ai">kickbacks.ai</a> ·
-  <a href="https://github.com/andrewmccalip/kickbacks/issues">Issues</a>
+  <a href="https://github.com/andrewmccalip/kickbacks.ai">GitHub</a> ·
+  <a href="https://github.com/andrewmccalip/kickbacks.ai/issues">Issues</a>
 </p>
 
 ---
@@ -15,7 +16,7 @@ Kickbacks works with the **Claude Code** and **Codex** VS Code extensions, and
 with the **Claude Code terminal CLI**. While either tool is thinking, its
 spinner shows a random verb ("Discombobulating...", "Baking..."). Kickbacks
 replaces that verb with a tiny, clickable sponsored line. Advertisers bid for
-the slot; **50% of every dollar they spend is credited to you**.
+the slot; **up to 50% of the resulting ad revenue is credited to you**.
 
 In a terminal, the same ad appears two ways: a clickable line in the status bar
 (every Claude Code version) and the thinking-spinner verb itself (Claude Code
@@ -27,7 +28,7 @@ Your balance shows in the VS Code status bar and updates in real time.
 ## Features
 
 - **Earn passively** — impressions and clicks accrue while Claude Code or Codex works. Clicks earn 50× an impression.
-- **50/50 revenue split** — half of advertiser spend is yours, credited per impression and click.
+- **Revenue share** — up to 50% of ad revenue, credited per impression and click.
 - **Fully reversible** — one click restores Claude Code to its original state.
 - **Zero interference** — never reads your code, prompts, or completions.
 - **Auto-updates** — new versions install silently in the background.
@@ -38,6 +39,10 @@ Your balance shows in the VS Code status bar and updates in real time.
 2. Click **Kickbacks: Sign in** in the status bar.
 3. Authenticate with Google.
 4. Start using Claude Code. Earnings begin automatically.
+
+Before you sign in you'll already see real sponsored lines in the spinner — a
+live preview of the product. **Those preview impressions don't earn you
+anything; sign in to start earning your share.**
 
 Your balance appears in the status bar: **Kickbacks ($0.42 today · $7.11)**
 
@@ -64,11 +69,12 @@ Kickbacks communicates only with the Kickbacks backend at
 
 **Kickbacks never reads your code, prompts, completions, or any chat content.**
 
-Patching is done by modifying Claude Code's `webview/index.js` from a byte-exact
-backup (VS Code), and by editing `~/.claude/settings.json` to add a status-line
-script and a spinner-verb override (terminal CLI). Both edits are fully
-reversible — select *Restore Claude Code* from the menu at any time and the
-originals are restored byte-for-byte.
+Patching is done by modifying Claude Code's `webview/index.js` (and the Codex
+extension's webview bundle) from byte-exact backups (VS Code), and by editing
+`~/.claude/settings.json` to add a status-line script and a spinner-verb
+override (terminal CLI). All edits are fully reversible — select *Restore
+Claude Code* from the menu at any time and the originals are restored
+byte-for-byte.
 
 ## Commands
 
@@ -92,8 +98,8 @@ Works with both the **VS Code extensions** (Claude Code and Codex) and the
 | Status-bar line | Claude Code terminal CLI | Any Claude Code version |
 | Spinner verb | Claude Code terminal CLI | Claude Code **2.1.143+** |
 
-VS Code surfaces work on local VS Code, Remote-SSH, devcontainers, and
-code-server. The terminal status-bar line works on every Claude Code CLI; the
+VS Code surfaces work on local VS Code, Cursor, Remote-SSH, and devcontainers.
+The terminal status-bar line works on every Claude Code CLI; the
 terminal spinner-verb ad needs Claude Code 2.1.143 or newer (older CLIs simply
 keep their stock verbs — nothing breaks).
 
@@ -121,5 +127,6 @@ the spinner display text.
 ---
 
 <p align="center">
-  <a href="https://kickbacks.ai">kickbacks.ai</a>
+  <a href="https://kickbacks.ai">kickbacks.ai</a> ·
+  <a href="https://github.com/andrewmccalip/kickbacks.ai">GitHub</a>
 </p>

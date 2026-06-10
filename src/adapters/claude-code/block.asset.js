@@ -58,11 +58,18 @@
     '<rect width="13" height="13" rx="3" fill="#188a45"/>' +
     '<text x="6.5" y="9.6" font-size="9" font-family="monospace" ' +
     'font-weight="700" text-anchor="middle" fill="#fff">K</text></svg>';
-  var FAVICON = ICON_URL
-    ? '<img src="' + esc(ICON_URL) + '" width="13" height="13" ' +
-      'aria-hidden="true" style="vertical-align:middle;border-radius:3px;' +
-      'flex:0 0 auto;display:block;object-fit:contain" />'
-    : FAVICON_FALLBACK;
+  // The ad-icon <img>. Tagged data-va-icon="1" so the capture-phase error
+  // listener (see init) can swap it for the inline 'K' SVG if the image fails
+  // to load — covers a blocked/404 icon. NB the swap MUST be wired
+  // programmatically: CC's webview CSP is script-src 'nonce-...' with no
+  // 'unsafe-inline', so an inline onerror="" attribute would itself be blocked.
+  function faviconImg(url) {
+    return '<img src="' + esc(url) + '" width="13" height="13" ' +
+      'data-va-icon="1" aria-hidden="true" ' +
+      'style="vertical-align:middle;border-radius:3px;' +
+      'flex:0 0 auto;display:block;object-fit:contain" />';
+  }
+  var FAVICON = ICON_URL ? faviconImg(ICON_URL) : FAVICON_FALLBACK;
 
   // The block renders ONLY the ad, and ONLY while a turn is active. There is
   // no done-state and no Continue CTA (removed): when Claude Code is idle the
@@ -288,7 +295,7 @@
           // and elapsed is frozen at `pausedAt`; the next active turn
           // resumes by advancing sessionStartedAt past the idle gap so the
           // idle time is NEVER billed. (overlay surface only — see
-          // viewPause/freezeOverlay.)
+          // viewPause/dockOverlay.)
           paused: false, pausedAt: 0 };
         return;
       }
@@ -312,11 +319,21 @@
       var s = _vt[vtKey(adId, surface)];
       if (s && !s.paused) { s.paused = true; s.pausedAt = Date.now(); }
     }
-    function viewHide(_adId, _surface) {
-      // No-op under absolute-epoch baseline. Elapsed = now - sessionStartedAt
-      // continues to advance regardless of hide(); the next viewTick poll
-      // will still emit any due event (final view_tick, threshold-met, or
-      // error_impression) at its boundary.
+    // END a view session outright (ported from the codex phantom-billing
+    // fix — codex/block.asset.js viewEnd). Deleting the record stops the
+    // 250ms accumulator the moment the ad leaves the screen; a later
+    // viewShow() opens a FRESH session (new baseline, counters reset).
+    function viewEnd(adId, surface) {
+      try { delete _vt[vtKey(adId, surface)]; } catch (e) { /* best-effort */ }
+    }
+    function viewHide(adId, surface) {
+      // Was a documented no-op, which left every hide call site —
+      // dropOverlay, banner-hidden-during-turn, banner-gone — with an
+      // immortal session emitting view_tick/error_impression every 5s
+      // off-screen (the exact codex phantom-billing class). Hide now ENDS
+      // the session. PERSIST-AT-IDLE is unaffected: dockOverlay uses
+      // viewPause(), which keeps the session for the thaw to resume.
+      viewEnd(adId, surface);
     }
     function viewMaybeEmit(s) {
       // Paused (idle-frozen) sessions emit nothing: no view_tick,
@@ -399,8 +416,35 @@
       } catch (e) { return 0; }
     }
 
+    // Suspend/wake clamp: elapsed is absolute wall-clock, so a laptop
+    // suspend (or a long-frozen webview) would otherwise be billed as
+    // visible time AND replayed as a synchronous view_tick burst on wake
+    // (one tick per 5s of sleep — ~5760 POSTs after an 8h sleep). viewTick
+    // tracks when it last polled; a gap of more than two tick intervals
+    // means nothing was actually on screen, so every live (unpaused)
+    // session's baseline is shifted forward past the gap, keeping at most
+    // one TICK_MS of it billable — the catch-up loop then fires at most
+    // ONE tick per wake. Paused sessions are skipped: their resume path
+    // already excludes the whole pause window via pausedAt.
+    var SUSPEND_GAP_MS = TICK_MS * 2;
+    var _vtLastPollMs = 0;
     function viewTick() {
       try {
+        var now = Date.now();
+        var gap = _vtLastPollMs > 0 ? (now - _vtLastPollMs) : 0;
+        _vtLastPollMs = now;
+        if (gap > SUSPEND_GAP_MS) {
+          var excess = gap - TICK_MS;
+          for (var pk in _vt) {
+            var ps = _vt[pk];
+            if (!ps.paused) {
+              // Math.min: never push a baseline into the future (a session
+              // created post-wake, before this poll, must start at 0).
+              ps.sessionStartedAt =
+                Math.min(now, ps.sessionStartedAt + excess);
+            }
+          }
+        }
         for (var k in _vt) viewMaybeEmit(_vt[k]);
       } catch (e) { /* prime directive */ }
     }
@@ -441,16 +485,27 @@
     // treated as "no spinner" (=> idle path); only a node with real content
     // is a candidate. Still strictly class-scoped (cannot match editor /
     // markdown — prime directive preserved).
+    // Audit #28: among those already-matched candidates prefer the LAST
+    // non-empty row in document order. The transcript APPENDS, so the live
+    // animating row is always the latest; CC can leave a STALE prior row
+    // frozen mid-glyph (see GRACE_MS note above) while keeping it mounted —
+    // returning the FIRST non-empty row let that dead row shadow the live
+    // one mounted below it, so the freshness signature never changed and
+    // the ad was suppressed for the whole turn. The selector and the
+    // observation scope are UNCHANGED (prime directive: never widen
+    // detection); only the choice AMONG matched rows differs. Known corner:
+    // when the live row is emptied at turn end while a stale row remains,
+    // the stale row briefly becomes "the" row again — its frozen signature
+    // fails the freshness gate within GRACE_MS, so the normal idle dock
+    // follows, same as before.
     function findSpinner() {
       var els = document.querySelectorAll('[class*="spinnerRow_"]');
-      var firstEl = null;
+      var last = null;
       for (var i = 0; i < els.length; i++) {
         if (els[i].nodeType !== 1) continue;
-        if (!firstEl) firstEl = els[i];
-        if ((els[i].textContent || "").trim() !== "") return els[i];
+        if ((els[i].textContent || "").trim() !== "") last = els[i];
       }
-      return firstEl && (firstEl.textContent || "").trim() !== ""
-        ? firstEl : null;
+      return last;
     }
     // Liveness gate: CC keeps spinnerRow MOUNTED after the turn (it only
     // vanished before because our mutation made React tear it out — we no
@@ -518,15 +573,40 @@
           var clickEventUuid = newEventUuid();
           dlog("click.ad", { ct: CLICKTOKEN, surface: surface,
             visibleMs: vms, eventUuid: clickEventUuid });
+          // `ad=` is the attribution CLAIM — the same param the view-event
+          // pings carry (the pollAd-adopted identifier the block keys its
+          // _vt sessions on, i.e. the AD text). Without it the host's
+          // recent-ads registry (audit #17) could not resolve a click that
+          // lands during the ≤10s /ad poll lag after a rotation and billed
+          // it to the freshly-rotated campaign instead.
           ping("click?ct=" + encodeURIComponent(CLICKTOKEN)
             + "&corr=" + encodeURIComponent(CORR)
             + "&surface=" + encodeURIComponent(surface)
             + "&visible_ms=" + vms
+            + "&ad=" + encodeURIComponent(AD)
             + "&event_uuid=" + encodeURIComponent(clickEventUuid));
           return;
         }
         el = el.parentNode;
       }
+    }, true);
+
+    // Ad-icon load failure → inline 'K' badge. The icon normally arrives as a
+    // CSP-safe data: URI; this catches the residual cases (a stored https GCS
+    // URL the backend couldn't inline, or a genuine 404) so the slot never
+    // renders empty. `error` events don't bubble but DO fire in the capture
+    // phase on ancestors, so one document-level capture listener covers the
+    // overlay AND the banner. Programmatic by necessity — an inline onerror=""
+    // is blocked by CC's webview script-src CSP. Idempotent: swapping outerHTML
+    // for the SVG removes the data-va-icon node, so it can't re-fire.
+    document.addEventListener("error", function (ev) {
+      try {
+        var t = ev && ev.target;
+        if (t && t.tagName === "IMG" &&
+            t.getAttribute && t.getAttribute("data-va-icon") === "1") {
+          t.outerHTML = FAVICON_FALLBACK;
+        }
+      } catch (e) { /* prime directive: never let this disturb the page */ }
     }, true);
 
     // --- Usage-banner rewrite loop -------------------------------------
@@ -554,8 +634,31 @@
     // Fires impression_rendered/viewable exactly once per session for the
     // banner surface. Spinner has its own (st.sentRender / st.wasVisible).
     var _bannerSentRender = false, _bannerSentViewable = false;
+    // No-serve latch (wave-4 carry-over of the wave-2 /ad gate): the host
+    // answers /ad with an EMPTY payload on a confirmed kill, a deliberate
+    // disable, or any serving-gate refusal. A fetch ERROR is transient
+    // network and keeps today's keep-last-ad behavior; a SUCCESSFUL empty
+    // response is the no-serve signal. After TWO empty reads with no served
+    // payload between them (debounce against a single racing read; fetch
+    // errors neither count nor reset — only a real payload proves serving
+    // resumed) the block stops SHOWING anything — overlay dropped, banner
+    // hidden, every view session ended — instead of leaving the last
+    // creative painted (unbillable but visible) until idle/reload. Any
+    // served payload re-arms. The signed-out demo flow serves real
+    // payloads, so this only engages on a genuine stop.
+    var _adEmptyPolls = 0, _noServe = false;
     if (BANNER_ON) setInterval(function () {
       try {
+        // No-serve: keep the banner hidden and its session ended until the
+        // host serves again (see pollAd / enterNoServe).
+        if (_noServe) {
+          if (_bannerEl) {
+            try { _bannerEl.style.setProperty("display", "none", "important"); }
+            catch (e) { /* prime directive */ }
+          }
+          try { viewHide(AD, "banner"); } catch (e) { /* prime directive */ }
+          return;
+        }
         // IDLE-ONLY (user request): while CC is actively thinking the
         // spinner ad covers that turn — hide the banner ad. We keep a ref
         // to the element we clobbered (its text no longer matches
@@ -566,7 +669,9 @@
             try { _bannerEl.style.setProperty("display", "none", "important"); }
             catch (e) { /* prime directive */ }
           }
-          // W3: banner is hidden during spinner; pause its visibility count.
+          // W3: banner is hidden during spinner; END its visibility session
+          // (it must not bill while display:none — a fresh session starts
+          // when the banner un-hides at idle).
           try { viewHide(AD, "banner"); } catch (e) { /* prime directive */ }
           return;
         }
@@ -635,13 +740,19 @@
     // the overlay is frozen at idle (below), so the persisted spinner ad
     // remains the sole ad surface and the banner stays suppressed.
     var _spinnerActive = false;
-    // PERSIST-AT-IDLE (user request): when CC goes idle we no longer drop the
-    // overlay — we FREEZE it in place. While `_frozen` the overlay stays
-    // mounted at its last position, animation + repositioning are suspended,
-    // and billing is paused (viewPause). The next active turn thaws it (paint
-    // re-glues + viewShow resumes the same session). So the last ad shown
-    // persists on screen indefinitely without ever billing at idle.
-    var _frozen = false;
+    // PERSIST-AT-IDLE → DOCK-TO-COMPOSER (user request): when CC goes idle we
+    // don't drop the overlay AND we don't strand it at its last viewport pixel
+    // (that floated over transcript content on scroll). Instead `_frozen`
+    // marks idle (billing paused, "thinking" animation stopped) and we DOCK the
+    // overlay as a compact line just above CC's input/composer box — a stable,
+    // always-present bottom anchor — so it stays parked and out of the scrolled
+    // transcript. The next active turn thaws (paint re-glues to the verb +
+    // viewShow resumes the same session). If the composer can't be located on a
+    // given CC build, we DROP the idle ad (prime-directive fallback) rather
+    // than strand it. While idle the ad accrues NO view-time.
+    var _frozen = false;       // idle: billing paused, animation stopped
+    var _docked = false;       // idle overlay re-anchored above the composer
+    var _dockNode = null;      // cached composer element (read-only rect target)
     function ensureOverlay(row) {
       if (overlay && overlay.parentNode) return overlay;
       overlay = document.createElement("div");
@@ -681,6 +792,69 @@
         }
       } catch (e) { /* no layout (jsdom) — overlay still renders the ad */ }
     }
+    // Locate CC's input/composer box — the stable, always-present element at
+    // the panel bottom that the idle ad docks above. READ-ONLY (querySelector +
+    // getBoundingClientRect only; the composer is NEVER mutated — prime
+    // directive). This runs in the CC WEBVIEW document, which is isolated from
+    // the VS Code workbench, so a generic editable-textbox selector cannot
+    // match the Monaco editor. CC's composer is a contenteditable textbox
+    // (newer builds use contenteditable="plaintext-only", not "true"); we try
+    // the most specific selector first, then a plain textarea, and among
+    // matches pick the LOWEST visible one (the composer sits at the bottom).
+    // Returns null if nothing matches (CC restructured) — the caller then DROPS
+    // the idle ad rather than stranding it. The matched selector/class is
+    // logged once (composer.found) so the locator can be hardened to a stable
+    // hashed class later, the way the spinnerRow_ locator was.
+    var _composerLogged = false;
+    function findComposer() {
+      try {
+        var sels = ['[contenteditable][role="textbox"]',
+                    'div[contenteditable]', 'textarea'];
+        for (var s = 0; s < sels.length; s++) {
+          var els = document.querySelectorAll(sels[s]);
+          var best = null, bestTop = -1;
+          for (var i = 0; i < els.length; i++) {
+            var el = els[i];
+            if (el.nodeType !== 1) continue;
+            var r = el.getBoundingClientRect();
+            if (!(r.width > 0 && r.height > 0)) continue;   // visible only
+            if (r.top > bestTop) { bestTop = r.top; best = el; }
+          }
+          if (best) {
+            if (!_composerLogged) { _composerLogged = true;
+              dlog("composer.found", { sel: sels[s], tag: best.tagName,
+                cls: String(best.className || "").slice(0, 80) }); }
+            return best;
+          }
+        }
+      } catch (e) { /* no layout / prime directive */ }
+      return null;
+    }
+    // Park the idle overlay as a compact line in the gap just above the
+    // composer's top edge. Same read-only-rect technique as placeOverlay; keeps
+    // the overlay's existing height (the last verb line-height) so it stays a
+    // compact line and spans the composer width (theme-bg blends it in). The
+    // "dock," key prefix keeps it distinct from placeOverlay's key so the first
+    // dock write always lands.
+    function placeDocked(composer) {
+      try {
+        var r = composer.getBoundingClientRect();
+        if (r && (r.width || r.height || r.top || r.left)) {
+          var h = overlay.offsetHeight || 20;
+          var GAP = 4;
+          var top = r.top - h - GAP;
+          if (top < 0) top = 0;                  // clamp if composer near top
+          var key = "dock," + r.left + "," + top + "," + r.width;
+          if (key !== _rect) {
+            _rect = key;
+            overlay.style.left = r.left + "px";
+            overlay.style.top = top + "px";
+            overlay.style.minWidth = r.width + "px";
+            overlay.style.visibility = "visible";
+          }
+        }
+      } catch (e) { /* no layout */ }
+    }
     function dropOverlay() {
       // W3: stop the overlay-surface visibility accumulator for the
       // current ad. Banner accumulator (if running) is independent.
@@ -689,23 +863,94 @@
         overlay.parentNode.removeChild(overlay); } catch (e) {}
       overlay = null; _rect = ""; _shown = false;
       st.wasVisible = false; _spinnerActive = false; _frozen = false;
+      _docked = false; _dockNode = null;
       st.simStart = 0;
       _chromeSig = ""; _dotsEl = null; _elapsedEl = null;
     }
-    // Freeze the overlay in place at turn end instead of dropping it. The
-    // element stays mounted with its last-rendered frame (the frame() loop
-    // and paint() both no-op while `_frozen`), and billing is paused so the
-    // ad accrues NO view-time while idle. We deliberately keep `overlay`,
-    // `lastNode`, `_spinnerActive`, `st.sentRender`, and `st.wasVisible` set:
-    // the next active turn thaws (paint re-glues + viewShow resumes the same
-    // impression session — no duplicate impression_rendered/viewable). Only
-    // st.simStart is cleared so the per-turn elapsed timer restarts at 0 on
-    // the next turn (matching the old drop-and-recreate behavior).
-    function freezeOverlay() {
+    // Idle transition (replaces the old freeze-at-pixel). DOCK the overlay as a
+    // compact line above CC's composer and pause billing. We deliberately keep
+    // `overlay`, `lastNode`, `_spinnerActive`, `st.sentRender`, and
+    // `st.wasVisible` set: the next active turn thaws (paint re-glues to the
+    // verb + viewShow resumes the same impression session — no duplicate
+    // impression_rendered/viewable). st.simStart is cleared so the per-turn
+    // elapsed timer restarts at 0 next turn. The "thinking" dots are stopped
+    // (cleared via the cached child's textContent — NEVER innerHTML, which would
+    // detach the click anchor; see the clickable-overlay rule). PRIME-DIRECTIVE
+    // FALLBACK: if the composer can't be located, DROP the ad rather than
+    // strand it over content.
+    function dockOverlay() {
       if (_frozen) return;
+      var composer = findComposer();
+      if (!composer) {
+        dlog("loop.idle.dock_miss_drop", {});
+        dropOverlay();
+        lastNode = null;
+        return;
+      }
       _frozen = true;
+      _docked = true;
+      _dockNode = composer;
       try { viewPause(AD, "overlay"); } catch (e) { /* prime directive */ }
       st.simStart = 0;
+      try { if (_dotsEl) _dotsEl.textContent = ""; } catch (e) { /* safe */ }
+      placeDocked(composer);   // reposition immediately so it never strands
+      dlog("loop.idle.dock", {});
+    }
+    // Host stopped serving (two consecutive empty /ad payloads — see the
+    // _noServe declaration). Tear down every ad surface via the EXISTING
+    // drop paths and end every view session: the wave-2 host gate already
+    // refuses to BILL a stale overlay, this removes the PIXELS too.
+    function enterNoServe() {
+      if (_noServe) return;                 // idempotent
+      _noServe = true;
+      dlog("ad.no_serve", { emptyPolls: _adEmptyPolls });
+      try { dropOverlay(); } catch (e) { /* best-effort */ }
+      lastNode = null;
+      try { if (_bannerEl) _bannerEl.style.setProperty(
+        "display", "none", "important"); } catch (e) { /* prime directive */ }
+      try { viewHide(AD, "banner"); } catch (e) { /* best-effort */ }
+      // Belt & suspenders: END every remaining session. dropOverlay ended
+      // the overlay's and viewHide the banner's; the wipe covers stragglers
+      // so nothing can emit another view event while no-serve holds.
+      try { _vt = Object.create(null); } catch (e) { /* best-effort */ }
+    }
+    // Audit #27: pollAd adopted a DIFFERENT ad while the overlay is parked
+    // at idle (docked + frozen). paint() only runs in the active branch, so
+    // without this the docked line kept showing the OLD creative — its
+    // clicks opened the old URL but could not attribute (the old session is
+    // gone → visible_ms 0 → host 15s click floor) or misattributed to the
+    // new adId. Retarget the EXISTING stable child nodes ONLY: the ad-text
+    // TEXT NODE inside the anchor (nodeValue write) and the anchor's href
+    // attribute. NEVER innerHTML and never re-create the anchor — rewriting
+    // a live clickable element detaches it mid-click (a shipped bug, fixed
+    // once). The icon swap is deliberately deferred to the next thaw's
+    // structural rebuild (pollAd cleared _chromeSig, so the first active
+    // paint() rebuilds with the new FAVICON). Billing: pollAd already wiped
+    // _vt (the old ad's session is ENDED); the docked state stays
+    // NON-billing per persist-at-idle, so NO live session is started here —
+    // the next thaw's viewShow(AD) opens the NEW ad's session, and the
+    // click ping reads the swapped AD module var, so both attribute to the
+    // new ad. If the docked structure can't be retargeted safely
+    // (unexpected children), fall back to the existing drop path so a stale
+    // creative is never shown.
+    function retargetDockedOverlay() {
+      try {
+        var a = overlay && overlay.querySelector('a[data-vibe-ads-ad]');
+        var tn = a && a.firstChild;
+        if (!a || !tn || tn.nodeType !== 3) {
+          dlog("ad.dock_retarget_drop", {});
+          dropOverlay();
+          lastNode = null;
+          return;
+        }
+        tn.nodeValue = AD;          // text node only — anchor never detached
+        a.setAttribute("href", CLICKURL ? CLICKURL : "#");
+        dlog("ad.dock_retarget", { toId: AD_ID });
+      } catch (e) {
+        // Never show a stale creative: drop on any error (prime directive —
+        // dropOverlay only touches OUR element).
+        try { dropOverlay(); lastNode = null; } catch (e2) { /* no-op */ }
+      }
     }
     function paint(row, anim) {
       var now = Date.now();
@@ -776,12 +1021,16 @@
     // hidden. Content/animation + detection/idle stay on the slower loop.
     function frame() {
       try {
-        // While frozen the overlay holds its last viewport position (CC's
-        // spinner row is gone at idle, so there's nothing to re-glue to) —
-        // skip repositioning so the persisted ad doesn't collapse onto a
-        // zero-height/stale rect.
-        if (overlay && !_frozen && lastNode && lastNode.isConnected)
+        // Active: glue to the spinner verb. Idle+docked: keep parked above the
+        // composer (cheap getBoundingClientRect on the cached _dockNode — never
+        // a full-document query here; re-acquisition lives in evaluate()). If
+        // _dockNode disconnected, hold position this frame; evaluate() re-finds.
+        if (overlay && !_frozen && lastNode && lastNode.isConnected) {
           placeOverlay(lastNode);
+        } else if (overlay && _frozen && _docked
+                   && _dockNode && _dockNode.isConnected) {
+          placeDocked(_dockNode);
+        }
       } catch (e) { /* prime directive */ }
       try { window.requestAnimationFrame(frame); }
       catch (e) { setTimeout(frame, 16); }
@@ -799,7 +1048,24 @@
       try {
         fetch(BASE + "/ad").then(function (r) { return r.json(); })
           .then(function (j) {
-            if (!j || !j.adText) return;
+            if (!j || !j.adText) {
+              // SUCCESSFUL response, no ad = the host's no-serve signal
+              // (kill / disable / serving-gate refusal). Debounced to two
+              // consecutive reads — see the _noServe declaration. A fetch
+              // ERROR never reaches here (catch below keeps the last ad).
+              _adEmptyPolls++;
+              if (_adEmptyPolls >= 2) enterNoServe();
+              return;
+            }
+            _adEmptyPolls = 0;
+            if (_noServe) {
+              // Host resumed serving (possibly the SAME creative). Re-arm:
+              // the dropped overlay re-mounts on the next active paint()
+              // and the banner repaints on its next 1s tick.
+              _noServe = false;
+              _bannerLast = "";
+              dlog("ad.serve_resume", { adId: j.adId });
+            }
             var changed = (j.adId && j.adId !== AD_ID) || (j.adText !== AD) || (j.clickUrl !== CLICKURL);
             if (!changed) return;
             dlog("ad.rotated", { fromId: AD_ID, toId: j.adId, from: AD, to: j.adText });
@@ -808,11 +1074,7 @@
             CLICKURL = j.clickUrl || "";
             ICON_URL = j.iconUrl || "";
             // Rebuild favicon for new icon
-            FAVICON = ICON_URL
-              ? '<img src="' + esc(ICON_URL) + '" width="13" height="13" ' +
-                'aria-hidden="true" style="vertical-align:middle;border-radius:3px;' +
-                'flex:0 0 auto;display:block;object-fit:contain" />'
-              : FAVICON_FALLBACK;
+            FAVICON = ICON_URL ? faviconImg(ICON_URL) : FAVICON_FALLBACK;
             // Reset view-time sessions: old ad's accumulated time must not
             // carry over to the new ad's billing.
             _vt = Object.create(null);
@@ -826,7 +1088,14 @@
             _elapsedEl = null;
             // Force banner re-render
             _bannerLast = "";
-          }).catch(function () { /* best-effort */ });
+            // Audit #27: the docked idle overlay is not repainted by paint()
+            // (it only runs in the active branch) — retarget its stable
+            // child nodes in place so a stale creative never sits on screen.
+            if (overlay && _frozen) retargetDockedOverlay();
+          }).catch(function () {
+            // Fetch ERROR (loopback unreachable / transient network): keep
+            // the last ad — deliberately NOT the no-serve signal.
+          });
       } catch (e) { /* ignore */ }
     }
     setInterval(pollAd, 10000);
@@ -849,6 +1118,14 @@
       if (_evaluating) return;            // re-entrancy guard (observer+timer)
       _evaluating = true;
       try {
+        // No-serve (host /ad gate — see pollAd/enterNoServe): never paint
+        // or keep an overlay while the host has stopped serving, even with
+        // a live spinner. Biased toward HIDE, matching this evaluator's
+        // design. pollAd re-arms on the next served payload.
+        if (_noServe) {
+          if (overlay) { dropOverlay(); lastNode = null; }
+          return;
+        }
         var now = Date.now();
         var row = findSpinner();          // READ-ONLY, class-scoped
         // Content-freshness check (the missing piece that previously made
@@ -880,19 +1157,34 @@
           (typeof realAct.ts === "number" && realAct.ts > 0 &&
            (now - realAct.ts) > TXN_STALE_MS)));
         if (domActive && !txnIdle) {
-          if (_frozen) { _frozen = false; dlog("loop.thaw", {}); }
+          if (_frozen) {
+            _frozen = false; _docked = false; _dockNode = null;
+            dlog("loop.thaw", {});
+          }
           paint(row, true);
         } else if (overlay && !_frozen && ((now - lastSeenMs) > GRACE_MS
             || txnIdle || (glyphLed && !fresh))) {
-          // PERSIST-AT-IDLE (user request): the turn ended (DOM idle past
-          // GRACE, OR the transcript says done, OR a glyph-led row froze
-          // stale > GRACE_MS). We no longer drop the overlay — we FREEZE it
-          // so the last ad shown persists on screen, and we pause billing so
-          // no view-time accrues while idle. The next active turn thaws it.
-          dlog("loop.idle.freeze",
+          // Turn ended (DOM idle past GRACE, OR the transcript says done, OR a
+          // glyph-led row froze stale > GRACE_MS). DOCK the overlay above the
+          // composer and pause billing — no longer freeze-at-pixel (which
+          // floated over scrolled transcript content). The next active turn
+          // thaws it. If the composer can't be found, dockOverlay() DROPS the
+          // ad (prime-directive fallback).
+          dlog("loop.idle.dock_enter",
             { sinceSeenMs: now - lastSeenMs, txnIdle: txnIdle,
               staleFrozen: glyphLed && !fresh });
-          freezeOverlay();
+          dockOverlay();
+        } else if (overlay && _frozen && _docked
+            && (!_dockNode || !_dockNode.isConnected)) {
+          // Still idle but CC re-rendered/removed the composer element:
+          // re-acquire it (the 80ms cadence absorbs the one querySelectorAll),
+          // or DROP if it's truly gone — never strand the ad over content.
+          var c2 = findComposer();
+          if (c2) { _dockNode = c2; placeDocked(c2); }
+          else {
+            dlog("loop.idle.dock_lost_drop", {});
+            dropOverlay(); lastNode = null;
+          }
         }
       } catch (e) {
         dlog("loop.error", { msg: String(e && e.message || e).slice(0, 200) });

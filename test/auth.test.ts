@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -11,7 +11,7 @@ vi.mock("../src/log", () => ({ debugEnabled: () => false, dlog: () => {},
 
 import { AuthClient } from "../src/auth/client";
 import { createVault } from "../src/auth/vault";
-import { makeContext, _opened } from "./mocks/vscode";
+import { makeContext, _opened, _shown } from "./mocks/vscode";
 
 // Hermetic fallback file per test (never touch the real ~/.vibe-ads).
 const mkAuthFile = () => join(mkdtempSync(join(tmpdir(), "vibe-ads-auth-")), "auth.json");
@@ -21,6 +21,63 @@ const noExec = (async () => { throw new Error("no exec in tests"); }) as never;
 const pv = () => createVault("test", noExec);
 
 describe("AuthClient", () => {
+  it("uses explicit dev-bypass as an in-memory token only for loopback bases", async () => {
+    const oldKickbacks = process.env.KICKBACKS_DEV_BYPASS;
+    const oldVibeAds = process.env.VIBE_ADS_DEV_BYPASS;
+    process.env.VIBE_ADS_DEV_BYPASS = "1";
+    delete process.env.KICKBACKS_DEV_BYPASS;
+    const s = new Map<string, string>(), g = new Map<string, unknown>();
+    const ctx = {
+      secrets: { get: async (k: string) => s.get(k),
+        store: async (k: string, v: string) => { s.set(k, v); },
+        delete: async (k: string) => { s.delete(k); } },
+      globalState: { get: (k: string) => g.get(k),
+        update: async (k: string, v: unknown) => { g.set(k, v); } },
+      subscriptions: [],
+    };
+    const f = vi.fn(async () => ({ ok: false, status: 500 }) as Response);
+    try {
+      const a = new AuthClient("http://127.0.0.1:6080", ctx as never,
+        f as never, 0, mkAuthFile(), pv());
+      await a.loadCached();
+      expect(a.accessToken()).toBe("dev-bypass");
+      expect(a.signedIn()).toBe(true);
+      expect(await a.refresh()).toBe(true);
+      expect(f).not.toHaveBeenCalled();
+      expect(s.size).toBe(0);
+    } finally {
+      if (oldKickbacks === undefined) delete process.env.KICKBACKS_DEV_BYPASS;
+      else process.env.KICKBACKS_DEV_BYPASS = oldKickbacks;
+      if (oldVibeAds === undefined) delete process.env.VIBE_ADS_DEV_BYPASS;
+      else process.env.VIBE_ADS_DEV_BYPASS = oldVibeAds;
+    }
+  });
+
+  it("refuses dev-bypass when the backend base is not loopback", async () => {
+    const old = process.env.VIBE_ADS_DEV_BYPASS;
+    process.env.VIBE_ADS_DEV_BYPASS = "1";
+    const s = new Map<string, string>(), g = new Map<string, unknown>();
+    const ctx = {
+      secrets: { get: async (k: string) => s.get(k),
+        store: async (k: string, v: string) => { s.set(k, v); },
+        delete: async (k: string) => { s.delete(k); } },
+      globalState: { get: (k: string) => g.get(k),
+        update: async (k: string, v: unknown) => { g.set(k, v); } },
+      subscriptions: [],
+    };
+    try {
+      const a = new AuthClient("https://api.kickbacks.ai", ctx as never,
+        (async () => ({ ok: false, status: 500 }) as Response) as never,
+        0, mkAuthFile(), pv());
+      await a.loadCached();
+      expect(a.accessToken()).toBeNull();
+      expect(a.signedIn()).toBe(false);
+    } finally {
+      if (old === undefined) delete process.env.VIBE_ADS_DEV_BYPASS;
+      else process.env.VIBE_ADS_DEV_BYPASS = old;
+    }
+  });
+
   it("signIn opens the broker URL then polls until tokens, stores in SecretStorage", async () => {
     const ctx = makeContext();
     let polls = 0;
@@ -312,5 +369,209 @@ describe("AuthClient refresh failure clears session (H1)", () => {
     expect(a.signedIn()).toBe(false);
     vi.doUnmock("../src/log");
     vi.resetModules();
+  });
+});
+
+// Shared isolated ctx for the audit-fix suites below (makeContext shares a
+// module-global secrets Map; these need a clean per-test namespace).
+const isoCtx = () => {
+  const s = new Map<string, string>(), g = new Map<string, unknown>();
+  return {
+    secrets: { get: async (k: string) => s.get(k),
+      store: async (k: string, v: string) => { s.set(k, v); },
+      delete: async (k: string) => { s.delete(k); } },
+    globalState: { get: (k: string) => g.get(k),
+      update: async (k: string, v: unknown) => { g.set(k, v); } },
+    subscriptions: [],
+  };
+};
+// Locked/absent Secret Service (keyring-less Linux): get works, store THROWS
+// — the env the file fallback exists for. `seed` pre-populates the cache.
+const lockedCtx = (seed?: [string, string][]) => {
+  const s = new Map<string, string>(seed), g = new Map<string, unknown>();
+  return {
+    secrets: { get: async (k: string) => s.get(k),
+      store: async () => {
+        throw new Error("Cannot create an item in a locked collection"); },
+      delete: async (k: string) => { s.delete(k); } },
+    globalState: { get: (k: string) => g.get(k),
+      update: async (k: string, v: unknown) => { g.set(k, v); } },
+    subscriptions: [],
+  };
+};
+
+// audit 2026-06-09 #11: ctx.secrets.store() is best-effort — a throwing
+// keyring must not abort activation (loadCached) nor turn a server-side-
+// successful refresh into a sign-out after the rotating token was consumed.
+describe("AuthClient keyring store failures are best-effort (#11)", () => {
+  it("loadCached survives a throwing keyring store and still re-mints from the file", async () => {
+    const file = mkAuthFile();
+    writeFileSync(file, JSON.stringify({ refresh: "plain:1:RT", clientId: "cid11" }));
+    const f = vi.fn(async (url: string) =>
+      url.includes("/auth/refresh")
+        ? { ok: true, status: 200, json: async () =>
+            ({ access_token: "AT", refresh_token: "RT2" }) } as Response
+        : { ok: false, status: 500 } as Response);
+    const a = new AuthClient("http://b", lockedCtx() as never, f as never, 0, file, pv());
+    await a.loadCached();           // pre-fix: REJECTED at the re-warm store()
+    expect(a.accessToken()).toBe("AT");
+    expect(a.signedIn()).toBe(true);
+    // The rotated token still landed in the durable file (sealToFile).
+    expect(JSON.parse(readFileSync(file, "utf8")).refresh).toBe("plain:1:RT2");
+  });
+
+  it("a successful rotation with a dead keyring still counts as success", async () => {
+    const file = mkAuthFile();
+    const f = vi.fn(async (url: string) =>
+      url.includes("/auth/refresh")
+        ? { ok: true, status: 200, json: async () =>
+            ({ access_token: "AT2", refresh_token: "RT2" }) } as Response
+        : { ok: false, status: 500 } as Response);
+    const a = new AuthClient("http://b",
+      lockedCtx([["kickbacks.refresh", "RT"]]) as never, f as never, 0, file, pv());
+    expect(await a.refresh()).toBe(true);     // pre-fix: false (store threw)
+    expect(a.accessToken()).toBe("AT2");
+    expect(JSON.parse(readFileSync(file, "utf8")).refresh).toBe("plain:1:RT2");
+    expect(a.storageInfo().keyringDurable).toBe(false); // probe sees dead keyring
+  });
+});
+
+// audit 2026-06-09 #37: interactive sign-in is single-flighted, and a still-
+// running poll loop exits silently if sign-in arrived via another path.
+describe("AuthClient interactive sign-in single-flight (#37)", () => {
+  it("concurrent signIn() calls coalesce onto ONE state + browser tab + poll loop", async () => {
+    const openedBefore = _opened.length;
+    let starts = 0, polls = 0;
+    const f = vi.fn(async (url: string) => {
+      if (url.includes("/extension/start")) {
+        starts++;
+        return { status: 307, headers: { get: (k: string) =>
+          k.toLowerCase() === "location" ? "https://g/auth?state=S1" : null } } as unknown as Response;
+      }
+      polls++;
+      if (polls < 2) return { ok: true, status: 200, json: async () => ({ status: "pending" }) } as Response;
+      return { ok: true, status: 200, json: async () =>
+        ({ access_token: "AT", refresh_token: "RT" }) } as Response;
+    });
+    const a = new AuthClient("http://b", isoCtx() as never, f as never, 0, mkAuthFile(), pv());
+    const [r1, r2] = await Promise.all([a.signIn(), a.signIn()]);
+    expect(r1).toBe(true);
+    expect(r2).toBe(true);
+    expect(starts).toBe(1);                        // pre-fix: 2 parallel flows
+    expect(_opened.length - openedBefore).toBe(1); // one browser tab, not two
+  });
+
+  it("a still-polling loop exits silently (no error toast) once signed in via another path", async () => {
+    const shownBefore = _shown.length;
+    let polls = 0;
+    let client: AuthClient | undefined;
+    const f = vi.fn(async (url: string) => {
+      if (url.includes("/extension/start"))
+        return { status: 307, headers: { get: (k: string) =>
+          k.toLowerCase() === "location" ? "https://g/auth?state=S1" : null } } as unknown as Response;
+      if (url.includes("/auth/refresh"))
+        return { ok: true, status: 200, json: async () =>
+          ({ access_token: "AT-R", refresh_token: "RT2" }) } as Response;
+      polls++;                       // poll endpoint: this state NEVER completes
+      if (polls === 2) await client?.refresh("RT"); // background path signs us in
+      return { ok: true, status: 200, json: async () => ({ status: "pending" }) } as Response;
+    });
+    client = new AuthClient("http://b", isoCtx() as never, f as never, 0, mkAuthFile(), pv());
+    expect(await client.signIn()).toBe(true); // pre-fix: false after 120 polls
+    expect(polls).toBeLessThan(120);          // pre-fix: full 3-minute loop
+    expect(client.accessToken()).toBe("AT-R");
+    // No "sign-in timed out" toast minutes after the user already signed in.
+    expect(_shown.slice(shownBefore).filter((m) => m.kind === "error")).toEqual([]);
+  });
+});
+
+// audit 2026-06-09 #33: clientId() runs on EVERY metrics send; it must not
+// read-merge-write auth.json unless the id is actually missing there — the
+// unconditional RMW could resurrect a refresh envelope another window had
+// just rotated (single-use token => clobber = sign-out).
+describe("AuthClient clientId() write discipline (#33)", () => {
+  it("does NOT rewrite auth.json when the id is already on disk", async () => {
+    const file = mkAuthFile();
+    const a1 = new AuthClient("http://b", isoCtx() as never, (async () => ({})) as never, 0, file, pv());
+    const id = a1.clientId();                 // first call creates the file
+    utimesSync(file, 1, 1);                   // sentinel mtime
+    const stamp = statSync(file).mtimeMs;
+    expect(a1.clientId()).toBe(id);           // warm path (globalState hit)
+    const a2 = new AuthClient("http://b", isoCtx() as never, (async () => ({})) as never, 0, file, pv());
+    expect(a2.clientId()).toBe(id);           // cold path (id read FROM file)
+    // pre-fix: both calls unconditionally rewrote the file (mtime moves).
+    expect(statSync(file).mtimeMs).toBe(stamp);
+  });
+
+  it("a needed write merges with the on-disk token envelope, never clobbers it", async () => {
+    const file = mkAuthFile();
+    // Another window just sealed a rotated token; this window has no id yet.
+    writeFileSync(file, JSON.stringify({ refresh: "plain:1:ROTATED" }));
+    const a = new AuthClient("http://b", isoCtx() as never, (async () => ({})) as never, 0, file, pv());
+    const id = a.clientId();                  // must write (id missing on disk)
+    const fb = JSON.parse(readFileSync(file, "utf8"));
+    expect(fb.clientId).toBe(id);
+    expect(fb.refresh).toBe("plain:1:ROTATED"); // envelope preserved
+  });
+});
+
+// audit 2026-06-09 #10: only an EXPLICIT server rejection may discard tokens.
+// Pre-fix, _refresh's catch (and every !ok status) nulled `at` — a pure
+// network blip during the activation-time forced refresh permanently signed
+// the user out in-memory (demo demotion, user-credit loss) with no retry path.
+describe("AuthClient refresh transient-vs-fatal (#10)", () => {
+  // Signed-in client with AT0 in memory and RT in secrets; `f` is swappable.
+  const mkSignedIn = async (f: (url: string) => Promise<unknown>) => {
+    const ctx = isoCtx();
+    await ctx.secrets.store("kickbacks.access", "AT0");
+    await ctx.secrets.store("kickbacks.refresh", "RT");
+    const a = new AuthClient("http://b", ctx as never, f as never, 0, mkAuthFile(), pv());
+    await a.loadCached();
+    expect(a.accessToken()).toBe("AT0");
+    return a;
+  };
+
+  it("a NETWORK throw keeps the tokens; a later refresh() succeeds", async () => {
+    let online = false;
+    const a = await mkSignedIn(async (url: string) => {
+      if (!url.includes("/auth/refresh")) return { ok: false, status: 500 };
+      if (!online) throw new Error("ENOTFOUND");   // Wi-Fi not up yet
+      return { ok: true, status: 200, json: async () =>
+        ({ access_token: "AT2", refresh_token: "RT2" }) };
+    });
+    expect(await a.refresh()).toBe(false);   // transient failure reported...
+    expect(a.accessToken()).toBe("AT0");     // ...but session NOT discarded
+    expect(a.signedIn()).toBe(true);         // pre-fix: false forever
+    online = true;                           // network returns minutes later
+    expect(await a.refresh()).toBe(true);    // retry path works
+    expect(a.accessToken()).toBe("AT2");
+  });
+
+  it("a 5xx is transient: tokens kept", async () => {
+    const a = await mkSignedIn(async () => ({ ok: false, status: 503 }));
+    expect(await a.refresh()).toBe(false);
+    expect(a.accessToken()).toBe("AT0");     // pre-fix: nulled on any !ok
+    expect(a.signedIn()).toBe(true);
+  });
+
+  it("an explicit 401 still clears the session (H1 contract preserved)", async () => {
+    const a = await mkSignedIn(async () => ({ ok: false, status: 401 }));
+    expect(await a.refresh()).toBe(false);
+    expect(a.accessToken()).toBeNull();      // explicit rejection => signed out
+    expect(a.signedIn()).toBe(false);
+  });
+
+  it("a 400 with an invalid_grant-style body is an explicit rejection", async () => {
+    const a = await mkSignedIn(async () => ({ ok: false, status: 400,
+      clone: () => ({ text: async () => '{"detail":"invalid_grant"}' }) }));
+    expect(await a.refresh()).toBe(false);
+    expect(a.accessToken()).toBeNull();
+  });
+
+  it("a 4xx WITHOUT a rejection body (gateway noise) is transient", async () => {
+    const a = await mkSignedIn(async () => ({ ok: false, status: 429,
+      clone: () => ({ text: async () => "rate limited" }) }));
+    expect(await a.refresh()).toBe(false);
+    expect(a.accessToken()).toBe("AT0");
   });
 });

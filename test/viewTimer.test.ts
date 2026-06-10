@@ -7,6 +7,14 @@ function clock(): { now: () => number; advance: (ms: number) => void } {
   return { now: () => t, advance: (ms) => { t += ms; } };
 }
 
+// NOTE (audit 2026-06-09 #23 / wave-1 EXT-03, verified 2026-06-10): the
+// ViewTimer class under test is NOT shipped — no production code imports it
+// (the live timers are block.asset.js `_vt`, codex/block.asset.js, and
+// statusBarAd.ts's inline interval). The no-op hide()/pause() and unbounded
+// catch-up semantics pinned below are therefore DEAD-CODE contracts kept for
+// the reference implementation only; the shipped surfaces END sessions on
+// hide and clamp suspend/wake gaps — see test/cc-viewtimer.test.ts for the
+// production contract. Port that clamp before ever wiring this class up.
 describe("ViewTimer (W3)", () => {
   // Tests focused on the natural threshold-met path disable the
   // error_impression safety net (`maxSessionMs: 0`). With the default cap of

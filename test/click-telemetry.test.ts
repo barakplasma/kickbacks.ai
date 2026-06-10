@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { JSDOM, VirtualConsole } from "jsdom";
+import { Loopback } from "../src/loopback";
 
 // Click-through telemetry is the revenue-bearing signal in the Kickbacks
 // auction. The CC block tries sendBeacon FIRST (Electron lifecycle-safe
@@ -217,6 +218,49 @@ describe("CC click-through telemetry — sendBeacon-first, fetch fallback",
     a.click();
     await flushMicrotasks();
     expect(defaultPrevented).toBe(false);
+  });
+
+  it("click ping carries the ad= attribution CLAIM (wave-4 fix 4): the same "
+    + "param the view-event pings send — the pollAd-adopted identifier the "
+    + "block keys its _vt sessions on (the ad TEXT) — and a REAL loopback "
+    + "lifts it into onClick's claimedAdId", async () => {
+    const h = makeHarness({ beacon: true });
+    bootBlock(h.dom);
+    makeAd(h.dom.window.document, { surface: "overlay" }).click();
+    await flushMicrotasks();
+    expect(h.beacons).toHaveLength(1);
+    const u = new URL(h.beacons[0].url);
+    // Without this claim the host's recent-ads registry (audit #17) cannot
+    // resolve a click landing in the ≤10s /ad poll-lag window after a
+    // rotation — it would bill the freshly-rotated campaign instead.
+    expect(u.searchParams.get("ad")).toBe("Ramp - Save time & money");
+
+    // End-to-end: replay the EXACT query the block emitted against a live
+    // loopback server and assert the host parses the same param name into
+    // onClick's claimedAdId (loopback.ts click route → `ad=` →
+    // webviewInjection.resolveAttribution upstream).
+    const clicks: Array<{ ct: string; claimedAdId?: string }> = [];
+    const lb = new Loopback({
+      onEvent: () => { /* not under test */ },
+      onClick: (ct, _surface, _visibleMs, _eventUuid, claimedAdId) => {
+        clicks.push({ ct, claimedAdId });
+      },
+      getActivity: () => ({}),
+      getCurrentAd: () => null,
+    });
+    try {
+      const { port, token } = await lb.start();
+      expect(port).toBeGreaterThan(0);
+      const res = await fetch(
+        `http://127.0.0.1:${port}/vibe-ads/${token}/click${u.search}`,
+        { method: "POST" });
+      expect(res.status).toBe(204);
+    } finally {
+      await lb.stop();
+    }
+    expect(clicks).toHaveLength(1);
+    expect(clicks[0].ct).toBe("ctok-abc123");
+    expect(clicks[0].claimedAdId).toBe("Ramp - Save time & money");
   });
 
   it("clicks on a CHILD element of the ad anchor still attribute correctly "

@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync,
          statSync } from "node:fs";
+import { transcriptEntrypoint } from "../../locate";
 
 /** Ad considered fresh for 10 minutes after the extension last wrote it. */
 export const FRESH_MS = 10 * 60 * 1000;
@@ -16,13 +17,26 @@ export function cliAdPath(home = homedir()): string {
   return join(vibeAdsDir(home), "cli-ad.json");
 }
 
+/** Terminal esc()-analog: strip control chars (C0 + DEL + C1) — and ONLY
+ *  those — so cached fields can never smuggle ANSI/OSC bytes into a terminal
+ *  surface. Emoji / pipes / unicode / URLs pass through untouched. */
+export function stripControlChars(s: string): string {
+  return s.replace(/[\x00-\x1f\x7f-\x9f]/g, "");
+}
+
 export function writeCliAdCache(
   home: string,
   ad: { adText: string; iconRef: string; iconUrl: string; clickUrl: string },
 ): void {
   const dir = vibeAdsDir(home);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const rec: CliAd = { ...ad, ts: Date.now() };
+  const rec: CliAd = {
+    adText: stripControlChars(ad.adText),
+    iconRef: stripControlChars(ad.iconRef),
+    iconUrl: stripControlChars(ad.iconUrl),
+    clickUrl: stripControlChars(ad.clickUrl),
+    ts: Date.now(),
+  };
   writeFileSync(cliAdPath(home), JSON.stringify(rec), "utf8");
 }
 
@@ -35,27 +49,34 @@ export function readCliAdCache(home: string): CliAd | null {
   } catch { return null; }
 }
 
-/** Evidence that a `claude` CLI session is plausibly live: the newest
- *  ~/.claude/projects/ ** /*.jsonl transcript was modified within `windowMs`.
- *  `root` overridable for tests. Never throws. */
+/** Evidence that a `claude` CLI session is plausibly live: a
+ *  ~/.claude/projects/ ** /*.jsonl transcript was modified within `windowMs`
+ *  AND is not the VS Code panel's own (entrypoint:"claude-vscode") — editor
+ *  turns write the same tree, and counting them inflated advertiser-facing
+ *  statusline/spinner impression counts for a surface that never rendered
+ *  (audit #30). Untagged transcripts (older CC builds) stay fail-open as
+ *  CLI-plausible. `root` overridable for tests. Never throws. */
 export function cliSessionActive(
   now: number, windowMs: number, root = join(homedir(), ".claude", "projects"),
 ): boolean {
   try {
     if (!existsSync(root)) return false;
-    let newest = 0;
+    const recent: { p: string; m: number }[] = [];
     for (const proj of readdirSync(root)) {
       let entries: string[];
       try { entries = readdirSync(join(root, proj)); } catch { continue; }
       for (const f of entries) {
         if (!f.endsWith(".jsonl")) continue;
+        const p = join(root, proj, f);
         try {
-          const m = statSync(join(root, proj, f)).mtimeMs;
-          if (m > newest) newest = m;
+          const m = statSync(p).mtimeMs;
+          if (m > 0 && (now - m) <= windowMs) recent.push({ p, m });
         } catch { /* ignore */ }
       }
     }
-    return newest > 0 && (now - newest) <= windowMs;
+    // Newest-first so the common case (one live transcript) probes one head.
+    recent.sort((a, b) => b.m - a.m);
+    return recent.some((c) => transcriptEntrypoint(c.p) !== "claude-vscode");
   } catch { return false; }
 }
 

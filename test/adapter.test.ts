@@ -33,6 +33,24 @@ describe("ClaudeCodeAdapter", () => {
     expect(pf.version).not.toBeNull();
   });
 
+  it("version(): strips CC's platform-specific packaging suffix", () => {
+    // CC moved to platform packages (…-win32-x64); the label must read the
+    // bare semver, not "2.1.161-win32-x64" — across every platform/arch combo.
+    const v = (dir: string) =>
+      new ClaudeCodeAdapter(`/x/${dir}/webview/index.js`).version();
+    expect(v("anthropic.claude-code-2.1.161-win32-x64")).toBe("2.1.161");
+    expect(v("anthropic.claude-code-2.1.161-darwin-arm64")).toBe("2.1.161");
+    expect(v("anthropic.claude-code-2.1.180-linux-x64")).toBe("2.1.180");
+    expect(v("anthropic.claude-code-2.1.143")).toBe("2.1.143"); // legacy, no suffix
+  });
+
+  it("version(): 'unknown' when the path has no claude-code dir segment", () => {
+    // The no-target sentinel path resolves to no semver — never throw, never
+    // mislabel.
+    expect(new ClaudeCodeAdapter("/__vibe_ads_no_target__").version())
+      .toBe("unknown");
+  });
+
   it("isPatched(): false pristine, true after applyPatch, false after restore",
     () => {
     const a = new ClaudeCodeAdapter(target);
@@ -41,6 +59,74 @@ describe("ClaudeCodeAdapter", () => {
     expect(a.isPatched()).toBe(true);
     a.restore();
     expect(a.isPatched()).toBe(false);
+  });
+
+  it("diagnose(): compatible fixture reports live array + bare verb present", () => {
+    const d = new ClaudeCodeAdapter(target).diagnose();
+    expect(d.compatible).toBe(true);
+    expect(d.targetExists).toBe(true);
+    expect(d.live.hasArray).toBe(true);
+    expect(d.live.bareVerbPresent).toBe(true);
+  });
+
+  it("diagnose(): stripped file reports incompatible, no array, no bare verb (→ reinstall CC)", () => {
+    writeFileSync(target, 'var V=["Alpha","Bravo"];', "utf8");
+    const d = new ClaudeCodeAdapter(target).diagnose();
+    expect(d.compatible).toBe(false);
+    expect(d.live.hasArray).toBe(false);
+    expect(d.live.bareVerbPresent).toBe(false);
+  });
+
+  it("diagnose(): verb word present but not in an array (→ bundle-format change)", () => {
+    writeFileSync(target, 'var msg="Discombobulating the widgets";', "utf8");
+    const d = new ClaudeCodeAdapter(target).diagnose();
+    expect(d.compatible).toBe(false);
+    expect(d.live.hasArray).toBe(false);
+    expect(d.live.bareVerbPresent).toBe(true);
+  });
+
+  it("findArray is resilient: locates the array via an alternate verb when Discombobulating is gone", () => {
+    // Simulate a future CC that renamed/removed "Discombobulating" but kept the
+    // verb array (with other distinctive verbs). Detection must survive.
+    writeFileSync(target,
+      'var Gz1=["Working","Flibbertigibbeting","Brewing","Clauding","Cooking"];', "utf8");
+    expect(new ClaudeCodeAdapter(target).preflight().compatible).toBe(true);
+  });
+
+  it("preflight still incompatible when NONE of the anchor verbs are present", () => {
+    writeFileSync(target, 'var V=["Alpha","Bravo","Charlie","Delta"];', "utf8");
+    expect(new ClaudeCodeAdapter(target).preflight().compatible).toBe(false);
+  });
+
+  it("preflight falls back to the live file when the backup is stale (no verb array)", () => {
+    // Field repro (shipuser machine): a tainted/truncated .kickbacks-backup
+    // lacks the verb array, so preflight USED to read it and dead-end as
+    // incompatible even though the live CC build is fine. It must now fall back
+    // to the live file and report compatible.
+    const a = new ClaudeCodeAdapter(target);
+    writeFileSync(target + ".kickbacks-backup", "garbage without the anchor", "utf8");
+    expect(a.preflight().compatible).toBe(true);
+  });
+
+  it("applyPatch recaptures a clean backup when the existing one is stale", () => {
+    const a = new ClaudeCodeAdapter(target);
+    const bak = target + ".kickbacks-backup";
+    writeFileSync(bak, "garbage without the anchor", "utf8");
+    const res = a.applyPatch(params);
+    expect(res.ok).toBe(true);
+    expect(a.isPatched()).toBe(true);
+    // The stale backup was replaced by a fresh capture from the live file, so
+    // the pristine source once again carries the verb array.
+    expect(readFileSync(bak, "utf8")).toContain('"Discombobulating"');
+  });
+
+  it("preflight incompatible only when BOTH backup and live lack the array", () => {
+    const a = new ClaudeCodeAdapter(target);
+    writeFileSync(target, 'var V=["A","B","C"];', "utf8");          // live: no anchor
+    writeFileSync(target + ".kickbacks-backup", "also no anchor", "utf8"); // backup: no anchor
+    const pf = a.preflight();
+    expect(pf.compatible).toBe(false);
+    expect(pf.reason).toContain("verb array not found");
   });
 
   it("preflight incompatible (graceful) when anchor missing — no writes", () => {

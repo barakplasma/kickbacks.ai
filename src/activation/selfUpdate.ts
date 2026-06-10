@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { writeFileSync, readFileSync, statSync } from "node:fs";
 import { UpdateClient } from "../update/client";
+import { timeoutFetch } from "../util/http";
 import { buildVersion } from "../buildinfo";
 import { dlog } from "../log";
 import { errMsg } from "../util/errMsg";
@@ -58,7 +59,14 @@ export function setupSelfUpdate(
     writeFileSync(p, Buffer.from(vsix));
     await vscode.commands.executeCommand(
       "workbench.extensions.installExtension", vscode.Uri.file(p));
-    await ctx.globalState.update("kickbacks.debug.on", true);
+    // Re-arm injection for the new build, but PRESERVE a deliberate user
+    // disable (audit EXT-01 / 2A-02). K_ON === false means the user explicitly
+    // ran "Disable Kickbacks"; undefined/true means default-on or already-on.
+    // The old unconditional `= true` stomped an explicit opt-out on every
+    // self-update, so the only durable opt-out was uninstall.
+    if (ctx.globalState.get<boolean>("kickbacks.debug.on") !== false) {
+      await ctx.globalState.update("kickbacks.debug.on", true);
+    }
     dlog("ext", "selfupdate.installed", { path: p });
     void (async () => {
       try {
@@ -107,7 +115,13 @@ export function setupSelfUpdate(
     } catch { /* toast best-effort */ }
   };
 
-  const updater = new UpdateClient(updateBase, currentVersion, fetch, installVsix, {
+  // audit-2026-06-09 #38: passing bare global `fetch` here silently bypassed
+  // the class's timeoutFetch(120000) default — a black-holed manifest/VSIX
+  // connection (2A-01 hang class) would park checkOnce forever and, with the
+  // #31 single-flight guard, wedge every later poll behind it. Same 120s
+  // budget as the class default.
+  const updater = new UpdateClient(updateBase, currentVersion,
+      timeoutFetch(120000), installVsix, {
     attempted: (v, sha) => ringSeen(ctx, UPD_KEY, updKey(v, sha), UPD_COOLDOWN_MS),
     markAttempted: (v, sha) => { ringMark(ctx, UPD_KEY, updKey(v, sha)); },
     transientFailed: (v, sha) =>

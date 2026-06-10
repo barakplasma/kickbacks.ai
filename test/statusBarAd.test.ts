@@ -6,24 +6,29 @@ function makeDeps(overrides: Partial<StatusBarAdDeps> = {}): StatusBarAdDeps & {
   statusBar: { set: ReturnType<typeof vi.fn>; lastState: unknown };
   metrics: { send: ReturnType<typeof vi.fn> };
   showActive: ReturnType<typeof vi.fn>;
-  logTail: { current: ReturnType<typeof vi.fn> };
+  logTail: {
+    current: ReturnType<typeof vi.fn>;
+    activityAgeMs: ReturnType<typeof vi.fn>;
+  };
 } {
   const statusBar = { set: vi.fn(), lastState: null as unknown };
   statusBar.set.mockImplementation((s: unknown) => { statusBar.lastState = s; });
   const metrics = { send: vi.fn() };
   const showActive = vi.fn().mockResolvedValue(undefined);
-  const logTail = { current: vi.fn().mockReturnValue(null) };
+  const logTail = {
+    current: vi.fn().mockReturnValue(null),
+    activityAgeMs: vi.fn().mockReturnValue(null),
+  };
   return {
     logTail: logTail as any,
     metrics: metrics as any,
     statusBar,
-    adRef: { current: { adId: "ad1", campaignId: "c1", seat: "s1",
+    adRef: { current: { adId: "ad1", campaignId: "c1",
       adText: "Try Acme Widgets", iconRef: "", iconUrl: "",
       clickUrl: "https://acme.com", bannerEnabled: false,
       sessionToken: "tok1" } },
     killedRef: { current: false },
     ccVersion: "2.1.143",
-    isSignedIn: () => true,
     showActive,
     timers: [],
     barState: { adShowing: false },
@@ -48,6 +53,27 @@ describe("setupStatusBarAd", () => {
     vi.advanceTimersByTime(3000);
     expect(d.statusBar.set).not.toHaveBeenCalled();
     expect(d.metrics.send).not.toHaveBeenCalled();
+  });
+
+  it("shows ad text when the transcript is fresh but not parseable yet", () => {
+    const d = makeDeps();
+    d.logTail.current.mockReturnValue(null);
+    d.logTail.activityAgeMs.mockReturnValue(500);
+    setupStatusBarAd(d);
+    vi.advanceTimersByTime(1000);
+    expect(d.statusBar.set).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "ad", adText: "Try Acme Widgets" }));
+    expect(d.metrics.send).toHaveBeenCalledWith("impression_rendered",
+      expect.objectContaining({ surface: "statusbar" }));
+  });
+
+  it("ignores stale transcript writes when the tail cannot be parsed", () => {
+    const d = makeDeps();
+    d.logTail.current.mockReturnValue(null);
+    d.logTail.activityAgeMs.mockReturnValue(5000);
+    setupStatusBarAd(d);
+    vi.advanceTimersByTime(3000);
+    expect(d.statusBar.set).not.toHaveBeenCalled();
   });
 
   it("does nothing when done === true (idle)", () => {
@@ -125,12 +151,20 @@ describe("setupStatusBarAd", () => {
     expect(d.showActive).toHaveBeenCalledTimes(1);
   });
 
-  it("does not show ad when signed out", () => {
-    const d = makeDeps({ isSignedIn: () => false });
+  it("does NOT show a (demo) ad when signed out — keeps the Sign-in label", () => {
+    // Demo mode: a signed-out user has a demo ad in hand (from the demo
+    // portfolio), but the status bar must NOT render it — the lower status-bar
+    // text stays the red "Kickbacks: Sign in" call-to-action while signed out.
+    // The demo ad still renders in-window (the overlay surface); only this
+    // status-bar surface gates on sign-in. No impression metrics fire either,
+    // since nothing is shown here.
+    const d = makeDeps();
+    d.adRef.current = { ...d.adRef.current!, demo: true, sessionToken: "" };
     d.logTail.current.mockReturnValue(thinking());
     setupStatusBarAd(d);
     vi.advanceTimersByTime(3000);
     expect(d.statusBar.set).not.toHaveBeenCalled();
+    expect(d.metrics.send).not.toHaveBeenCalled();
   });
 
   it("does not show ad when killed", () => {
@@ -223,5 +257,113 @@ describe("setupStatusBarAd", () => {
     d.killedRef.current = true;
     vi.advanceTimersByTime(2000);
     expect(d.showActive).not.toHaveBeenCalled();
+  });
+
+  // Audit #1: the 60s portfolio refresh adopts fresh session tokens by
+  // REPLACING the ad object in adRef (300s server TTL). Every billable
+  // emission must carry the CURRENT token for the shown adId — a frozen
+  // snapshot token 403s on any show outliving the TTL.
+  it("adopts a fresh session token from adRef mid-show (view_tick + viewable)", () => {
+    const d = makeDeps();
+    d.logTail.current.mockReturnValue(thinking());
+    setupStatusBarAd(d);
+    vi.advanceTimersByTime(1000);            // show starts, snapshots tok1
+    // 60s refresh: same ad, fresh token, NEW object (adRotation token-adopt).
+    d.adRef.current = { ...d.adRef.current!, sessionToken: "tok2" };
+    vi.advanceTimersByTime(5000);            // next view_tick fires
+    const ticks = d.metrics.send.mock.calls.filter(
+      (c: unknown[]) => c[0] === "view_tick");
+    expect(ticks.length).toBeGreaterThanOrEqual(1);
+    expect(ticks[ticks.length - 1][1]).toMatchObject(
+      { adId: "ad1", sessionToken: "tok2" });
+    d.logTail.current.mockReturnValue(idle());
+    vi.advanceTimersByTime(1000);            // endShow
+    const viewable = d.metrics.send.mock.calls.filter(
+      (c: unknown[]) => c[0] === "impression_viewable");
+    expect(viewable).toHaveLength(1);
+    expect(viewable[0][1]).toMatchObject(
+      { adId: "ad1", sessionToken: "tok2" });
+  });
+
+  // Audit #1 guard: token adoption must never cross ad identities. When the
+  // rotation swaps adRef to a DIFFERENT ad mid-show, the show keeps billing
+  // (and displaying) the ad it actually shows — old id, old token, old text.
+  it("does not adopt a different ad's token mid-show (rotation swap)", () => {
+    const d = makeDeps();
+    d.logTail.current.mockReturnValue(thinking());
+    setupStatusBarAd(d);
+    vi.advanceTimersByTime(1000);
+    d.adRef.current = { ...d.adRef.current!, adId: "ad2",
+      sessionToken: "tok9", adText: "Other Ad" };
+    vi.advanceTimersByTime(5000);
+    const ticks = d.metrics.send.mock.calls.filter(
+      (c: unknown[]) => c[0] === "view_tick");
+    expect(ticks[ticks.length - 1][1]).toMatchObject(
+      { adId: "ad1", sessionToken: "tok1" });
+    expect(d.statusBar.lastState).toMatchObject(
+      { kind: "ad", adText: "Try Acme Widgets" });
+  });
+
+  // Audit #29: a paint suppressed by the needs-reload lock (StatusBar.set
+  // returns false) must not start billing — no impression_rendered, no
+  // view_tick, and the arbiter flag stays false.
+  it("never bills when the bar suppresses the ad paint (reloadLock)", () => {
+    const d = makeDeps();
+    d.statusBar.set.mockImplementation((s: unknown) => {
+      d.statusBar.lastState = s; return false; });
+    d.logTail.current.mockReturnValue(thinking());
+    setupStatusBarAd(d);
+    vi.advanceTimersByTime(12_000);
+    expect(d.metrics.send).not.toHaveBeenCalled();
+    expect(d.barState.adShowing).toBe(false);
+  });
+
+  // Audit #29: if the lock engages MID-show, the next 1s re-assert paint is
+  // suppressed — the show must end (impression_viewable with the accrued
+  // visible time) and view_tick must stop; no new show starts while locked.
+  it("ends the show when the re-assert paint is suppressed mid-show", () => {
+    const d = makeDeps();
+    d.logTail.current.mockReturnValue(thinking());
+    setupStatusBarAd(d);
+    vi.advanceTimersByTime(6000);            // showing + ≥1 view_tick
+    d.statusBar.set.mockImplementation((s: unknown) => {
+      d.statusBar.lastState = s; return false; });
+    vi.advanceTimersByTime(1000);            // next poll: repaint suppressed
+    expect(d.metrics.send).toHaveBeenCalledWith("impression_viewable",
+      expect.objectContaining({ surface: "statusbar" }));
+    expect(d.barState.adShowing).toBe(false);
+    const ticksBefore = d.metrics.send.mock.calls.filter(
+      (c: unknown[]) => c[0] === "view_tick").length;
+    const renderedBefore = d.metrics.send.mock.calls.filter(
+      (c: unknown[]) => c[0] === "impression_rendered").length;
+    vi.advanceTimersByTime(15_000);          // still thinking, still locked
+    const ticksAfter = d.metrics.send.mock.calls.filter(
+      (c: unknown[]) => c[0] === "view_tick").length;
+    const renderedAfter = d.metrics.send.mock.calls.filter(
+      (c: unknown[]) => c[0] === "impression_rendered").length;
+    expect(ticksAfter).toBe(ticksBefore);    // billing stopped with the show
+    expect(renderedAfter).toBe(renderedBefore); // no new show while locked
+  });
+
+  it("suspend clamp: a sleep gap mid-show is not billed as visible time", () => {
+    // Pre-fix visibleMs was a raw wall-clock span (now - showStart): an 8h
+    // laptop suspend mid-show inflated the next view_tick and the final
+    // impression_viewable by the whole sleep. Now each timer tick accrues at
+    // most 2 poll intervals, so the gap collapses to one capped slice.
+    const d = makeDeps();
+    d.logTail.current.mockReturnValue(thinking());
+    setupStatusBarAd(d);
+    vi.advanceTimersByTime(5000);            // 5s genuinely visible
+    // Suspend: wall clock jumps 8h with NO timer ticks, then one poll fires.
+    vi.setSystemTime(Date.now() + 8 * 3600_000);
+    vi.advanceTimersByTime(1000);
+    d.logTail.current.mockReturnValue(idle()); // end the show
+    vi.advanceTimersByTime(1000);
+    const viewable = d.metrics.send.mock.calls.find(
+      (c: unknown[]) => c[0] === "impression_viewable");
+    expect(viewable).toBeTruthy();
+    const visibleMs = (viewable![1] as { visibleMs: number }).visibleMs;
+    expect(visibleMs).toBeLessThan(20_000);  // ~7s real, never 8h
+    expect(visibleMs).toBeGreaterThanOrEqual(5000);
   });
 });

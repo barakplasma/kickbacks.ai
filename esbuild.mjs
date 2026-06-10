@@ -35,6 +35,9 @@ const BUILD_FLAGS = {
   verbose: isTrue(ROOT_ENV.KICKBACKS_VERBOSE ?? "false"),
   codex: isTrue(ROOT_ENV.KICKBACKS_CODEX ?? "false"),
   testHooks: isTrue(ROOT_ENV.KICKBACKS_TEST_HOOKS ?? "false"),
+  manifestPubkeyPem: ROOT_ENV.KICKBACKS_MANIFEST_PUBKEY_PEM
+    ?? ROOT_ENV.VIBE_ADS_MANIFEST_PUBKEY_PEM
+    ?? "",
 };
 
 function copyAsset(src, dest) {
@@ -42,36 +45,13 @@ function copyAsset(src, dest) {
   copyFileSync(src, dest);
 }
 
-// Stamp a build timestamp into package.json `description` so the running
-// build is identifiable in the VS Code Extensions panel (ends the "did my
-// reload pick up the new bundle?" guesswork). HARDENED: strips EVERY prior
-// " · built <ts>" segment (greedy from the first occurrence to end) — the old
-// trailing-only regex left duplicate "· built …Z · built …Z" suffixes when
-// concurrent builds / reverts interleaved (observed in the wild). Targeted
-// single-line edit; formatting preserved.
 const stamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 // Captured from package.json `version` below and baked into the bundle so the
 // running extension can compare its own semver against the deploy sentinel.
 let pkgVersion = "0.0.0";
-// Re-assert marketplace metadata on EVERY build. The repo is worked by a
-// parallel agent fleet that periodically reverts/reformats package.json
-// (see project memory); without this, author/license/links silently vanish
-// from shipped VSIXs. JSON round-trip keeps it format-stable & idempotent.
 {
   const pj = JSON.parse(readFileSync("package.json", "utf8"));
   pkgVersion = String(pj.version || "0.0.0");
-  pj.author ??= { name: "Andrew McCalip", url: "https://github.com/andrewmccalip" };
-  pj.license ??= "SEE LICENSE IN LICENSE";
-  pj.homepage ??= "https://kickbacks.ai";
-  pj.bugs ??= { url: "https://github.com/andrewmccalip/kickbacks/issues" };
-  const c = pj.contributes?.commands;
-  if (c && !c.some((x) => x.command === "kickbacks.signOut")) {
-    const i = c.findIndex((x) => x.command === "kickbacks.signIn");
-    if (i >= 0) c.splice(i + 1, 0,
-      { command: "kickbacks.signOut", title: "Kickbacks: Sign out" });
-  }
-  pj.description = "Get paid while you code. Subtle, clickable ads in the Claude Code and Codex spinners — 50/50 revenue split to users.";
-  writeFileSync("package.json", JSON.stringify(pj, null, 2) + "\n");
 }
 await build({
   entryPoints: ["src/extension.ts"],
@@ -90,7 +70,8 @@ await build({
             __SITE_URL__: JSON.stringify(BUILD_FLAGS.siteUrl),
             __BUILD_VERBOSE__: JSON.stringify(BUILD_FLAGS.verbose),
             __BUILD_CODEX_OPTIN__: JSON.stringify(BUILD_FLAGS.codex),
-            __BUILD_TEST_HOOKS_OPTIN__: JSON.stringify(BUILD_FLAGS.testHooks) },
+            __BUILD_TEST_HOOKS_OPTIN__: JSON.stringify(BUILD_FLAGS.testHooks),
+            __MANIFEST_PUBKEY_PEM__: JSON.stringify(BUILD_FLAGS.manifestPubkeyPem) },
 });
 // The injected block is a shipped raw asset (NOT bundled).
 copyAsset("src/adapters/claude-code/block.asset.js",
@@ -106,16 +87,17 @@ copyAsset("src/adapters/codex-cli/wrapper.cmd.asset",
           "dist/adapters/codex-cli/wrapper.cmd.asset");
 copyAsset("src/adapters/codex-cli/wrapper.sh.asset",
           "dist/adapters/codex-cli/wrapper.sh.asset");
-// Ship the DETAILS-pane readme as README.md (the source file is .vscodeignore'd
-// and vsce only renders README.md) with the absolute build time stamped in, so
-// the marketplace DETAILS body always reflects the shipped build.
+// Generate the DETAILS-pane readme under dist. scripts/package.mjs copies it
+// into the temporary VSCE package root as README.md. The tracked source of
+// record is readme_extension.md; there is intentionally no bare README.md in
+// extension/ (only the repo-root README.md keeps that name).
 try {
   const rd = readFileSync("readme_extension.md", "utf8")
     .replace(/<!-- BUILD -->.*$/m, "")
     .replace(/(<\/h1>)/i, `$1\n\n<!-- BUILD --> <p align="center"><sub>build ${stamp}</sub></p>`);
-  writeFileSync("README.md", rd);
+  writeFileSync("dist/README.md", rd);
 } catch { /* readme is best-effort; never fail the build */ }
-console.log(`built dist/extension.js + CC & Codex block assets + README.md (build ${stamp})`);
+console.log(`built dist/extension.js + CC & Codex block assets + dist/README.md (build ${stamp})`);
 console.log(`  build flags: developer=${BUILD_FLAGS.developer}`
   + ` verbose=${BUILD_FLAGS.verbose} codex=${BUILD_FLAGS.codex}`
   + ` testHooks=${BUILD_FLAGS.testHooks}`

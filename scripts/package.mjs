@@ -1,5 +1,15 @@
 import { spawnSync } from "node:child_process";
-import { readFileSync, copyFileSync, readdirSync, unlinkSync } from "node:fs";
+import {
+  copyFileSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -23,10 +33,60 @@ const STABLE = "kickbacks.vsix";
 
 // scripts/package.mjs -> extension/
 const extDir = join(fileURLToPath(import.meta.url), "..", "..");
+const stageDir = join(extDir, ".vsce-stage");
+
+function packageManifestForVsce(pkg) {
+  const pj = JSON.parse(JSON.stringify(pkg));
+  pj.author ??= {
+    name: "Andrew McCalip",
+    url: "https://github.com/andrewmccalip",
+  };
+  pj.license ??= "SEE LICENSE IN LICENSE";
+  pj.homepage ??= "https://kickbacks.ai";
+  pj.bugs ??= { url: "https://github.com/andrewmccalip/kickbacks/issues" };
+  const c = pj.contributes?.commands;
+  if (c && !c.some((x) => x.command === "kickbacks.signOut")) {
+    const i = c.findIndex((x) => x.command === "kickbacks.signIn");
+    if (i >= 0) c.splice(i + 1, 0,
+      { command: "kickbacks.signOut", title: "Kickbacks: Sign out" });
+  }
+  pj.description = "Get paid while you code. Subtle, clickable ads in the Claude Code and Codex spinners — 50/50 revenue split to users.";
+  return pj;
+}
+
+function stagePackage(pkg) {
+  rmSync(stageDir, { recursive: true, force: true });
+  mkdirSync(stageDir, { recursive: true });
+  writeFileSync(join(stageDir, "package.json"),
+    JSON.stringify(packageManifestForVsce(pkg), null, 2) + "\n");
+
+  const readme = existsSync(join(extDir, "dist", "README.md"))
+    ? readFileSync(join(extDir, "dist", "README.md"), "utf8")
+    : readFileSync(join(extDir, "readme_extension.md"), "utf8");
+  writeFileSync(join(stageDir, "README.md"), readme);
+
+  copyFileSync(join(extDir, "LICENSE"), join(stageDir, "LICENSE"));
+  cpSync(join(extDir, "dist"), join(stageDir, "dist"), { recursive: true });
+  rmSync(join(stageDir, "dist", "README.md"), { force: true });
+  cpSync(join(extDir, "media"), join(stageDir, "media"), { recursive: true });
+  writeFileSync(join(stageDir, ".vscodeignore"), [
+    "node_modules/**",
+    "src/**",
+    "test/**",
+    "scripts/**",
+    "*.vsix",
+    "package-lock.json",
+    "tsconfig.json",
+    "vitest.config.ts",
+    "esbuild.mjs",
+    ".vsce-stage/**",
+    "",
+  ].join("\n"));
+}
 
 function run() {
-  const { version } = JSON.parse(
-    readFileSync(join(extDir, "package.json"), "utf8"));
+  const pkg = JSON.parse(readFileSync(join(extDir, "package.json"), "utf8"));
+  const { version } = pkg;
   const versioned = versionedVsixName(version);
 
   // Drop any stale versioned vsix from prior builds so the dir always holds
@@ -37,12 +97,16 @@ function run() {
     }
   }
 
+  stagePackage(pkg);
+
   // shell:true so the vsce .cmd wrapper resolves on Windows (node_modules/.bin
-  // is on PATH under `npm run`).
+  // is on PATH under `npm run`). Package from a temporary staged root so build
+  // metadata never mutates tracked package.json / README.md.
   const r = spawnSync("vsce",
-    ["package", "--no-dependencies", "-o", STABLE],
-    { cwd: extDir, stdio: "inherit", shell: true });
+    ["package", "--no-dependencies", "-o", join(extDir, STABLE)],
+    { cwd: stageDir, stdio: "inherit", shell: true });
   if ((r.status ?? 1) !== 0) process.exit(r.status ?? 1);
+  rmSync(stageDir, { recursive: true, force: true });
 
   copyFileSync(join(extDir, STABLE), join(extDir, versioned));
   console.error(`packaged ${STABLE} + ${versioned} (v${version})`);

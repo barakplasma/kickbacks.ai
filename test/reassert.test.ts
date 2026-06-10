@@ -2,15 +2,17 @@ import { describe, it, expect } from "vitest";
 import { shouldReassert, desyncDecision } from "../src/reassert";
 
 describe("shouldReassert", () => {
-  const healthy = { signedIn: true, haveAd: true, killed: false };
+  const healthy = { haveAd: true, killed: false };
 
-  it("reasserts when signed in, have an ad, not killed", () => {
+  it("reasserts when an ad is in hand and not killed", () => {
     expect(shouldReassert(healthy)).toBe(true);
   });
-  it("does not reassert when signed out", () => {
-    expect(shouldReassert({ ...healthy, signedIn: false })).toBe(false);
+  it("reasserts while signed out as long as a (demo) ad is in hand", () => {
+    // Sign-in is no longer part of the gate — a signed-out demo ad must
+    // self-heal like the real product. `haveAd` is the only positive signal.
+    expect(shouldReassert({ haveAd: true, killed: false })).toBe(true);
   });
-  it("does not reassert when there is no ad", () => {
+  it("does not reassert when there is no ad (signed out with empty demo)", () => {
     expect(shouldReassert({ ...healthy, haveAd: false })).toBe(false);
   });
   it("does not reassert when kill-switched (never fights checkKill)", () => {

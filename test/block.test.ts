@@ -125,4 +125,82 @@ describe("block.asset", () => {
     expect(src).toContain("&corr=");
     expect(src).toContain("corr: CORR");
   });
+
+  // Idle DOCK-TO-COMPOSER (replaced freeze-at-pixel). The DOM state machine has
+  // no jsdom harness here (the asset runs in a vm with no document), so these
+  // are source-level guards mirroring the "Continue removed" test above. The
+  // behavioral check is the local VSIX (scroll an idle panel).
+  describe("idle dock-to-composer", () => {
+    const src = () => readFileSync(
+      join(__dirname, "../src/adapters/claude-code/block.asset.js"), "utf8");
+
+    it("docks above the composer at idle instead of freezing at a pixel", () => {
+      const s = src();
+      expect(s).toContain("function findComposer(");
+      expect(s).toContain("function placeDocked(");
+      expect(s).toContain("function dockOverlay(");
+      // The old freeze-at-pixel entry point is gone (renamed to dockOverlay).
+      expect(s).not.toContain("function freezeOverlay(");
+      expect(s).not.toContain("freezeOverlay()");
+      // Idle branch calls dockOverlay, not the removed freeze.
+      expect(s).toContain("dockOverlay();");
+    });
+
+    it("has a drop-at-idle fallback when the composer can't be located", () => {
+      const s = src();
+      // dockOverlay drops if findComposer returns null; the rAF/evaluate
+      // re-acquire path drops if the cached composer node disconnects.
+      expect(s).toContain("dock_miss_drop");
+      expect(s).toContain("dock_lost_drop");
+    });
+
+    it("composer locator is read-only and stops the dots via textContent (not innerHTML)", () => {
+      const s = src();
+      // Read-only locate: querySelector + getBoundingClientRect only.
+      const fc = s.slice(s.indexOf("function findComposer("),
+        s.indexOf("function placeDocked("));
+      expect(fc).toContain("querySelectorAll");
+      expect(fc).toContain("getBoundingClientRect");
+      // The locator must NEVER mutate CC's composer (prime directive): no
+      // assignment to innerHTML / textContent / style inside findComposer.
+      expect(fc).not.toContain("innerHTML");
+      expect(fc).not.toMatch(/\.textContent\s*=/);
+      expect(fc).not.toMatch(/\.style\b/);
+      // Stopping the "thinking" animation uses the cached child's textContent,
+      // never an innerHTML rewrite (which would detach the click anchor).
+      expect(s).toContain('_dotsEl.textContent = ""');
+    });
+
+    it("logs the matched composer selector so the locator can be hardened", () => {
+      expect(src()).toContain('dlog("composer.found"');
+    });
+  });
+
+  // View-timer billing integrity (audit 2026-06-09 findings #8/#15/#23).
+  // Behavioral coverage lives in cc-viewtimer.test.ts (jsdom); these are
+  // cheap source-level reintroduction guards in the style of the dock tests.
+  describe("view-timer billing guards (audit #8/#15/#23)", () => {
+    const src = () => readFileSync(
+      join(__dirname, "../src/adapters/claude-code/block.asset.js"), "utf8");
+
+    it("viewHide ENDS the matching _vt session (the no-op left dropped/" +
+       "hidden surfaces emitting error_impression every 5s forever)", () => {
+      const s = src();
+      expect(s).toContain("function viewEnd(");
+      const vh = s.slice(s.indexOf("function viewHide("),
+        s.indexOf("function viewMaybeEmit("));
+      expect(vh).toContain("viewEnd(adId, surface)");
+      expect(vh).not.toContain("No-op");
+    });
+
+    it("viewTick clamps suspend/wake poll gaps (no sleep billed, no " +
+       "view_tick burst replay on wake)", () => {
+      const s = src();
+      expect(s).toContain("SUSPEND_GAP_MS");
+      const vt = s.slice(s.indexOf("function viewTick("),
+        s.indexOf("setInterval(viewTick"));
+      expect(vt).toContain("gap > SUSPEND_GAP_MS");
+      expect(vt).toContain("sessionStartedAt");
+    });
+  });
 });

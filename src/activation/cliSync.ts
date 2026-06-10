@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
+import * as vscode from "vscode";
 import type { TargetAdapter } from "../adapters/types";
 import type { AuthClient } from "../auth/client";
 import type { MetricsClient } from "../metrics/client";
@@ -8,6 +9,7 @@ import type { DebugController } from "../debug";
 import type { PatchAd } from "../portfolio/client";
 import { ClaudeCliStatuslineAdapter } from "../adapters/claude-cli/adapter";
 import { detectClaudeCliSpinnerSupport } from "../adapters/claude-cli/cliVersion";
+import { notifyOutdatedCli } from "./outdatedCliNotice";
 import { CodexCliWrapperAdapter } from "../adapters/codex-cli/adapter";
 import { writeCliAdCache, cliSessionActive, shouldCountCliImpression,
   shouldCountSpinnerImpression, FRESH_MS }
@@ -15,11 +17,14 @@ import { writeCliAdCache, cliSessionActive, shouldCountCliImpression,
 import { dlog, codexCliEnabled } from "../log";
 import { errMsg } from "../util/errMsg";
 import { cliMode, webviewMode } from "../modes";
+import { servingVerdict } from "../servingGate";
 import type { ActivationContext } from "./context";
 import { restoreCodexSafe } from "./commands";
 
 export interface CliSyncDeps {
   actx: ActivationContext;
+  /** Extension context — used for globalState-deduped user notices. */
+  ctx: vscode.ExtensionContext;
   adapter: TargetAdapter;
   auth: AuthClient;
   metrics: MetricsClient;
@@ -55,11 +60,20 @@ export function locateCodexCliShim(): string | null {
   } catch { return null; }
 }
 
+/** Handle returned by setupCliSync: an imperative trigger to re-sync the CLI
+ *  surface NOW (instead of waiting for the 60s timer). Used by the ad-apply
+ *  choke point so a fresh ad — sign-in demo→real swap or a rotation — reaches
+ *  `~/.claude/settings.json` immediately. Guarded + idempotent, so callers can
+ *  fire it freely. */
+export interface CliSyncHandle {
+  syncNow: () => void;
+}
+
 /** Set up the CLI status-line surface and its sync timer. Wires the
  *  debug-menu reassert callbacks. Pushes timers into actx.timers. */
-export function setupCliSync(deps: CliSyncDeps): void {
+export function setupCliSync(deps: CliSyncDeps): CliSyncHandle {
   const {
-    actx, adapter, auth, metrics, debugCtl,
+    actx, ctx, adapter, auth, metrics, debugCtl,
     ccVersion, adRef, killedRef, reapplyCodex,
   } = deps;
   const overrideKilled = deps.overrideKilled;
@@ -89,9 +103,19 @@ export function setupCliSync(deps: CliSyncDeps): void {
 
   const syncCli = (): void => {
     try {
+      // Serving gate (wave 2, audit #3): pre-fix this 60s tick compared only
+      // the TEST override, so a live kill never stopped the re-apply that
+      // checkKill's cliStatus.restore() had just undone. Three-way now:
+      //   freeze   (offline-unsure / canary-suspended) → neither write nor
+      //            restore — keep the on-disk state, no churn;
+      //   write    (healthy + enabled) → the normal apply path below;
+      //   restore  (confirmed kill / user-disabled) → fall through to the
+      //            restore branch, same as ad-lost/signed-out.
+      const verdict = servingVerdict();
+      if (verdict === "freeze") return;
       const ad = adRef.current;
-      if (ad && auth.accessToken() && overrideKilled !== true
-          && cliMode() === "on") {
+      if (verdict === "write" && ad && auth.accessToken()
+          && overrideKilled !== true && cliMode() === "on") {
         const pfCli = actx.cliStatus!.preflight();
         if (pfCli.compatible) {
           actx.cliStatus!.applyPatch({ tier: 0, adText: ad.adText,
@@ -166,10 +190,17 @@ export function setupCliSync(deps: CliSyncDeps): void {
   // confirmed-new CLI starts counting the spinner impression, and a
   // positively-old CLI evicts the optimistically-written key (render flag
   // flips false) and never counts it.
-  void detectClaudeCliSpinnerSupport().then((ok) => {
+  void detectClaudeCliSpinnerSupport().then(({ ok, version, outdated }) => {
     if (actx.cliStatus) actx.cliStatus.spinnerVerbsSupported = ok;
     spinnerCountable = ok === true;
     dlog("ext", "cli.spinnerVerbs", { supported: ok });
+    // Only nag on a POSITIVELY old CLI — never the fail-open (undetectable)
+    // path, which would warn installs we can't even probe. Deduped per version.
+    // Skip when the install is killed: a remotely-disabled extension renders no
+    // ads anyway, so an "update your CLI" toast would be pure noise. (killedRef
+    // is a live getter — detection resolves async, so this reads the kill state
+    // as of resolution.)
+    if (outdated && version && !killedRef.current) notifyOutdatedCli(ctx, version);
     syncCli();
   }).catch(() => { /* fail-open render default stays; never count */ });
 
@@ -188,4 +219,6 @@ export function setupCliSync(deps: CliSyncDeps): void {
   debugCtl?.setReassertCodex(() => {
     try { reapplyCodex?.(); } catch { /* prime directive */ }
   });
+
+  return { syncNow: () => { try { syncCli(); } catch { /* prime directive */ } } };
 }

@@ -193,4 +193,48 @@ describe("Loopback", () => {
     expect(a.port).toBeGreaterThan(0);
     await lb.stop(); await lb.stop(); // no throw
   });
+
+  it("setHandlers live-swaps every route on the running server (audit #7 — "
+    + "the shared-loopback takeover)", async () => {
+    const seen: string[] = [];
+    lb = new Loopback({
+      onEvent: (k) => seen.push(`a:${k}`),
+      onClick: () => seen.push("a:click"),
+      getActivity: () => ({ who: "a" }),
+      getCurrentAd: () => ({ adText: "a-ad", clickUrl: "https://a.test",
+        iconUrl: "", adId: "a", campaignId: "a" }),
+    });
+    const { port, token } = await lb.start();
+    const base = `http://127.0.0.1:${port}/vibe-ads/${token}`;
+    expect((await (await fetch(`${base}/ad`)).json()).adId).toBe("a");
+    lb.setHandlers({
+      onEvent: (k) => seen.push(`b:${k}`),
+      onClick: () => seen.push("b:click"),
+      getActivity: () => ({ who: "b" }),
+      getCurrentAd: () => ({ adText: "b-ad", clickUrl: "https://b.test",
+        iconUrl: "", adId: "b", campaignId: "b" }),
+    });
+    // Same bound port + token; every route now dispatches to B.
+    expect((await (await fetch(`${base}/ad`)).json()).adId).toBe("b");
+    expect(await (await fetch(`${base}/activity`)).json())
+      .toEqual({ who: "b" });
+    expect((await fetch(`${base}/view_tick?surface=overlay`,
+      { method: "POST" })).status).toBe(204);
+    expect((await fetch(`${base}/click?ct=ck`, { method: "POST" })).status)
+      .toBe(204);
+    expect(seen).toContain("b:view_tick");
+    expect(seen).toContain("b:click");
+    expect(seen.filter((s) => s.startsWith("a:"))).toEqual([]);
+  });
+
+  it("isRunning() tracks bind state across start/stop (audit #7 — stale "
+    + "shared-server detection)", async () => {
+    lb = new Loopback({ onEvent: () => {}, onClick: () => {},
+      getActivity: () => ({}), getCurrentAd: () => null });
+    expect(lb.isRunning()).toBe(false);
+    await lb.start();
+    expect(lb.isRunning()).toBe(true);
+    await lb.stop();
+    expect(lb.isRunning()).toBe(false);
+  });
 });

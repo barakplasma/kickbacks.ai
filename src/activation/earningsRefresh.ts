@@ -3,6 +3,7 @@ import type { AuthClient } from "../auth/client";
 import type { EarningsClient } from "../earnings/client";
 import type { SessionState } from "../sessionState";
 import type { SbState } from "../statusbar";
+import { servingGateSnapshot } from "../servingGate";
 
 export interface EarningsRefreshResult {
   showActive: () => Promise<void>;
@@ -37,17 +38,51 @@ export function setupEarningsRefresh(
   };
 
   const showActive = async (): Promise<void> => {
+    // Serving gate (wave 2, audit #4): pre-fix this 30s repaint clobbered
+    // the killed/offline/Off bar back to green "active ($… today)" within
+    // 30s of a kill or a deliberate "Disable Kickbacks". Safety/truth
+    // states always win (the Wave-1 status-bar contract): paint the gated
+    // state and never the earning label while the gate says no-serve.
+    const gate = servingGateSnapshot();
+    if (gate.kill === "confirmed") {
+      statusBar.set({ kind: "killed" });
+      return;
+    }
+    if (gate.kill === "offline") {
+      statusBar.set({ kind: "offline" });
+      return;
+    }
     if (!auth.accessToken()) {
       statusBar.set({ kind: "signed-out" });
       session.set({ signedIn: false });
       return;
     }
-    const e = await earningsClient.fetch();
-    if (e) {
-      lastUsd = e.lifetimeUsd; lastToday = e.todayUsd;
+    if (!gate.enabled || gate.suspended) {
+      // User-disabled (or crash-canary suspended): the red "Kickbacks: Off —
+      // click to re-enable" bar, the existing debug-OFF SbState.
+      statusBar.set({ kind: "debug", on: false });
+      return;
+    }
+    const r = await earningsClient.fetchDetailed();
+    // Token died during the await (sign-out / failed rotation mid-fetch):
+    // paint signed-out instead of a stale green "active" bar (audit #34).
+    if (!auth.accessToken()) {
+      statusBar.set({ kind: "signed-out" });
+      session.set({ signedIn: false });
+      return;
+    }
+    if (r.outcome === "ok") {
+      lastUsd = r.earnings.lifetimeUsd; lastToday = r.earnings.todayUsd;
       session.set({ signedIn: true, authHealthy: "ok" });
-    } else if (auth.accessToken()) {
+    } else if (r.outcome === "401") {
+      // Only a REAL backend 401 may raise the session-expired signal.
       session.set({ signedIn: true, authHealthy: "401" });
+    } else {
+      // Transient failure (network blip / 5xx / malformed body): keep the
+      // previous authHealthy verdict — pre-fix this branch asserted "401"
+      // and the debug menu falsely showed "Sign in again — your session
+      // expired" on every offline poll (audit #34).
+      session.set({ signedIn: true });
     }
     // Don't clobber a live status-bar ad — it owns the item until it reverts,
     // at which point statusBarAd calls showActive() again (adShowing=false)

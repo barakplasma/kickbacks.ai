@@ -1,5 +1,19 @@
 /** W3 ad-viewership tracker.
  *
+ *  WARNING — NOT SHIPPED (verified 2026-06-10, audit #23 / wave-1 EXT-03):
+ *  no production code imports this class. The esbuild bundle (entry
+ *  src/extension.ts) never reaches it; its only consumer is
+ *  test/viewTimer.test.ts. The LIVE view timers are block.asset.js (`_vt`,
+ *  CC overlay/banner), codex/block.asset.js, and statusBarAd.ts's inline
+ *  interval — all of which now END sessions on hide and CLAMP suspend/wake
+ *  poll gaps (see SUSPEND_GAP_MS in block.asset.js and the contract pinned
+ *  by test/cc-viewtimer.test.ts). This class still has the PRE-FIX
+ *  semantics by design of its 2026-05-22 refactor (no-op hide()/pause(),
+ *  unbounded wall-clock catch-up loop in emitTickIfDue — a laptop suspend
+ *  would replay the whole sleep gap as a billable tick burst on wake).
+ *  Do NOT wire it into a billing surface without first porting the
+ *  suspend-gap clamp + hide-ends-session semantics from block.asset.js.
+ *
  *  An ad must accumulate `thresholdMs` of cumulative ELAPSED TIME on a
  *  surface before it counts as "shown" and is eligible for credit. As of
  *  the absolute-epoch baseline refactor, elapsed time is computed as

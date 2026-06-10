@@ -10,8 +10,13 @@ try {
     && (Date.now() - o.ts) <= FRESH_MS
     && typeof o.adText === "string" && o.adText.length > 0;
   if (fresh) {
-    const text = "ad· " + o.adText;
-    const url = typeof o.clickUrl === "string" ? o.clickUrl : "";
+    // Terminal esc()-analog: strip control chars (C0 + DEL + C1) — and ONLY
+    // those — so adText/clickUrl can never emit ANSI/OSC sequences of their
+    // own (the OSC 8 framing below is the only escape this script prints).
+    // Emoji / pipes / unicode / URLs pass through untouched.
+    const strip = (s) => s.replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+    const text = "ad· " + strip(o.adText);
+    const url = typeof o.clickUrl === "string" ? strip(o.clickUrl) : "";
     const ESC = "";
     // OSC 8 hyperlink: ESC ]8;; URL ESC \  TEXT  ESC ]8;; ESC \
     const out = url

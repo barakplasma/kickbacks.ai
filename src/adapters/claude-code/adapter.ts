@@ -1,13 +1,23 @@
 import { readFileSync, writeFileSync, existsSync, rmSync,
   renameSync, unlinkSync, statSync } from "node:fs";
 import { resolve, dirname, join } from "node:path";
-import type { TargetAdapter, PreflightResult, OpResult, RestoreResult, PatchParams }
-  from "../types";
+import type { TargetAdapter, PreflightResult, OpResult, RestoreResult, PatchParams,
+  AdapterDiagnostics } from "../types";
 import { dlog } from "../../log";
 import { sha256 } from "../../util/crypto";
 import { resolveAsset } from "../../util/asset";
 
-const ANCHOR = '"Discombobulating"';
+// Distinctive nonsense/brand verbs from Claude Code's action-verb array. We
+// anchor on the SET, not a single literal, so renaming or removing any ONE verb
+// in a future CC release doesn't break detection — the array is still located
+// as long as ANY of these survive. All verified present (once each) in CC
+// 2.1.161's 84-verb array; they're made-up/brand words extremely unlikely to
+// appear elsewhere in the bundle, so a false match on a different array is
+// implausible. (Deep dive 2026-06-03; see [[cc-platform-specific-ext-dir]].)
+const ANCHORS = [
+  '"Discombobulating"', '"Flibbertigibbeting"', '"Combobulating"',
+  '"Clauding"', '"Reticulating"', '"Smooshing"', '"Wibbling"', '"Booping"',
+];
 // >=2 comma-separated double-quoted tokens (the S0 multi-element requirement).
 const ARRAY_RE = /\[(?:"[^"\\]*"\s*,\s*)+"[^"\\]*"\]/g;
 const BLOCK_START = "/* VIBE-ADS-START */";
@@ -174,16 +184,23 @@ export class ClaudeCodeAdapter implements TargetAdapter {
 
   private findArray(src: string): [number, number] | null {
     for (const m of src.matchAll(ARRAY_RE)) {
-      if (m[0].includes(ANCHOR)) return [m.index!, m.index! + m[0].length];
+      if (ANCHORS.some((a) => m[0].includes(a)))
+        return [m.index!, m.index! + m[0].length];
     }
     return null;
   }
 
   version(): string | null {
     // Version is the parent extension dir name segment, e.g.
-    // .../anthropic.claude-code-2.1.143/webview/index.js
-    const m = /anthropic\.claude-code-([0-9][^/\\]*)/.exec(this.target);
-    return m ? m[1] : "unknown";
+    // .../anthropic.claude-code-2.1.143/webview/index.js — or, since CC moved to
+    // platform-specific packages, .../anthropic.claude-code-2.1.161-win32-x64/…
+    // Capture just the semver core so neither the status bar nor telemetry ever
+    // shows the "-win32-x64" packaging suffix. Fall back to the raw tail if the
+    // shape is unexpected, so a locatable dir never regresses to "unknown".
+    const core = /anthropic\.claude-code-(\d+\.\d+\.\d+)/.exec(this.target);
+    if (core) return core[1];
+    const loose = /anthropic\.claude-code-([0-9][^/\\]*)/.exec(this.target);
+    return loose ? loose[1] : "unknown";
   }
 
   /** True iff the live target currently carries our injected block. One
@@ -199,50 +216,118 @@ export class ClaudeCodeAdapter implements TargetAdapter {
     }
   }
 
+  /** Ground-truth snapshot for the diagnose command. Never throws — every
+   *  read is guarded so the report renders even on a half-broken install. */
+  diagnose(): AdapterDiagnostics {
+    const out: AdapterDiagnostics = {
+      name: this.name, target: this.target, targetExists: existsSync(this.target),
+      version: this.version(), compatible: false, isPatched: false,
+      backup: { exists: false, path: null, hasArray: false, hasBlock: false },
+      live: { hasArray: false, bareVerbPresent: false },
+    };
+    try {
+      const pf = this.preflight();
+      out.compatible = pf.compatible;
+      out.reason = pf.reason;
+      out.isPatched = this.isPatched();
+      const bakPath = this.existingBackupPath();
+      if (bakPath) {
+        out.backup.exists = true;
+        out.backup.path = bakPath;
+        try {
+          const b = readFileSync(bakPath, "utf8");
+          out.backup.hasArray = this.findArray(b) !== null;
+          out.backup.hasBlock = b.includes(BLOCK_START);
+        } catch { /* leave defaults */ }
+      }
+      if (out.targetExists) {
+        try {
+          const live = readFileSync(this.target, "utf8");
+          out.live.hasArray = this.findArray(live) !== null;
+          // bare verb word present even if NOT inside a matchable array — the
+          // tell that distinguishes "bundle format changed" from "file stripped".
+          out.live.bareVerbPresent =
+            ANCHORS.some((a) => live.includes(a.replace(/"/g, "")));
+        } catch { /* leave defaults */ }
+      }
+    } catch { /* never throw */ }
+    return out;
+  }
+
   preflight(): PreflightResult {
     try {
       if (!existsSync(this.target))
         return { ok: true, compatible: false, version: null, reason: "target not found" };
-      // Self-heal: a co-located pristine backup means WE patched THIS exact
-      // file, so this build was provably compatible when captured. Our own
-      // Tier-0 swap removes the "Discombobulating" anchor from the live file,
-      // so checking the live file would falsely report "incompatible" and
-      // dead-end activation. Evaluate against the pristine backup instead —
-      // the same source applyPatch() works from (ensureBackup()). A CC update
-      // changes the extension dir name, so a stale backup never sits next to
-      // a new index.js; checking the co-located backup stays safe.
+      // Compatibility = the verb array is present in EITHER the pristine backup
+      // OR the live file. We prefer the backup (an older Tier-0 swap could strip
+      // the live anchor), but a STALE/TAINTED backup — a truncated capture, or a
+      // crash / self-update race mid-write — must NOT dead-end activation: fall
+      // back to the live file. The current patch only APPENDS a block and leaves
+      // the verb array intact, so the live file is a safe fallback. Only when
+      // NEITHER source carries the array is the build genuinely incompatible.
+      // This breaks the "bad backup ⇒ permanent incompatible" trap, where
+      // applyPatch's backup recapture never runs because preflight early-returns
+      // first. The reason + source are logged so a field miss is diagnosable.
       const bak = this.existingBackupPath();
-      const src = readFileSync(bak ?? this.target, "utf8");
-      if (this.findArray(src) === null)
+      const inBackup = bak !== null
+        && this.findArray(readFileSync(bak, "utf8")) !== null;
+      const inLive = inBackup
+        || this.findArray(readFileSync(this.target, "utf8")) !== null;
+      if (!inBackup && !inLive) {
+        try {
+          dlog("ext", "preflight.miss",
+            { hadBackup: bak !== null, version: this.version() });
+        } catch { /* dlog must never break preflight */ }
         return { ok: true, compatible: false, version: this.version(),
-                 reason: "verb array not found (incompatible build)" };
+                 reason: bak !== null
+                   ? "verb array not found (backup+live both stale)"
+                   : "verb array not found (incompatible build)" };
+      }
       return { ok: true, compatible: true, version: this.version() };
     } catch (e) {
       return { ok: false, compatible: false, version: null, reason: String(e) };
     }
   }
 
-  private ensureBackup(): Buffer {
+  private ensureBackup(): Buffer | null {
     const existing = this.existingBackupPath();
     if (existing) {
       const buf = readFileSync(existing);
-      // Backup-integrity check: a backup that EVER contains our injected
-      // block was captured AFTER an earlier patch leaked into the file
-      // (likely a CC self-update mid-apply race) — using it as pristine
-      // would compound the damage. Delete the bad backup and recapture
-      // from disk; if `target` itself is patched the recapture is still
-      // tainted but the next CC reinstall heals it, and at minimum the
-      // next applyPatch removes the EXISTING block before re-injecting,
-      // so the patched-on-patched recursion can't happen.
-      if (buf.indexOf(BLOCK_START) !== -1) {
-        try { dlog("ext", "backup.tainted",
-          { path: existing, action: "recapture" }); } catch { /* ignore */ }
+      // Backup-integrity check. A backup is a valid pristine source only if it
+      // (a) does NOT already contain our injected block AND (b) actually carries
+      // the verb array. (a) guards a backup captured AFTER an earlier patch
+      // leaked in (CC self-update mid-apply race) — reusing it would compound
+      // the damage. (b) guards a truncated/mangled capture (the stale backup
+      // that makes preflight read no array and dead-end) — patching from it
+      // would inject into broken content and keep failing. Either defect ⇒
+      // delete and recapture from the live file (the taint guard below refuses
+      // the recapture when `target` itself is patched, so a poisoned backup is
+      // never re-minted from a poisoned live file).
+      const tainted = buf.indexOf(BLOCK_START) !== -1;
+      const stale = this.findArray(buf.toString("utf8")) === null;
+      if (tainted || stale) {
+        try { dlog("ext", "backup.recapture",
+          { path: existing, tainted, stale }); } catch { /* ignore */ }
         try { unlinkSync(existing); } catch { /* fall through */ }
       } else {
         return buf;
       }
     }
     const raw = readFileSync(this.target);
+    // Taint guard (cross-window interleave): if the live file ALREADY carries
+    // our block — e.g. another window re-patched right after this window's
+    // restore() deleted the backup — capturing it would enshrine PATCHED bytes
+    // as "pristine": a later restore() would write the ad block back, pass its
+    // own sha check, delete the backup, and leave CC permanently patched even
+    // after opt-out/kill. The patch is not byte-exactly strippable (applyPatch
+    // collapses trailing whitespace before appending), so REFUSE to capture:
+    // no backup is written, applyPatch treats it as apply-success-no-write,
+    // and the next CC self-update delivers a fresh pristine file to capture.
+    if (raw.indexOf(BLOCK_START) !== -1) {
+      try { dlog("ext", "backup.refused",
+        { reason: "live file already patched" }); } catch { /* ignore */ }
+      return null;
+    }
     writeFileSync(this.backupPath(), raw);
     return raw; // pristine
   }
@@ -277,7 +362,14 @@ export class ClaudeCodeAdapter implements TargetAdapter {
   applyPatch(p: PatchParams): OpResult {
     try {
       if (!existsSync(this.target)) return { ok: false, reason: "target not found" };
-      const pristine = this.ensureBackup().toString("utf8");
+      const pristineBuf = this.ensureBackup();
+      // Taint-guard refusal: target already patched and no pristine backup
+      // exists to strip-and-reapply from. Do NOT write and do NOT capture —
+      // serving continues off the on-disk block until a CC self-update
+      // supplies a fresh pristine file. See ensureBackup.
+      if (pristineBuf === null)
+        return { ok: true, reason: "already patched; no pristine backup" };
+      const pristine = pristineBuf.toString("utf8");
       // We still call findArray as a compatibility GATE — if the verb
       // array literal isn't where we expect, this CC build's spinner
       // layout has changed and our block's DOM selectors are likely
@@ -336,9 +428,21 @@ export class ClaudeCodeAdapter implements TargetAdapter {
         return { ok: true, restored: false, reason: "no backup present" };
       }
       const pristine = readFileSync(bak);
-      writeFileSync(this.target, pristine);
+      // Taint guard: a backup captured from an already-patched live file (a
+      // pre-guard ensureBackup could mint one) carries our block — writing it
+      // verbatim would REINSTATE the ad, pass the sha check below, and delete
+      // the only backup. Strip our own block first so restore always removes
+      // the ad (the stripped bytes are the closest-to-pristine we hold).
+      let out = pristine;
+      if (pristine.indexOf(BLOCK_START) !== -1) {
+        try { dlog("ext", "restore.strip-tainted-backup", { path: bak }); }
+        catch { /* ignore */ }
+        out = Buffer.from(
+          pristine.toString("utf8").replace(BLOCK_RE, ""), "utf8");
+      }
+      writeFileSync(this.target, out);
       const now = sha256(readFileSync(this.target));
-      if (now !== sha256(pristine))
+      if (now !== sha256(out))
         return { ok: false, restored: false, reason: "sha256 mismatch after restore" };
       rmSync(bak);
       if (!opts?.keepCsp) this.restoreCsp(); // approach C: revert sibling CSP

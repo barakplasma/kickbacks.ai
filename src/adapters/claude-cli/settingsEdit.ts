@@ -175,6 +175,15 @@ export function removeTopLevel(src: string, key: string): string {
   let j = e;
   while (j < src.length && /\s/.test(src[j])) j++;
   if (src[j] === ",") { e = j + 1; trailingCommaConsumed = true; }
+  if (trailingCommaConsumed) {
+    // Also consume the whitespace run immediately before the key so removing
+    // an entry upsertTopLevel inserted (`\n  "key": value,` right after the
+    // root `{`) round-trips byte-exact — the CLI adapter's key-scoped
+    // restore() relies on this to leave a never-edited settings.json exactly
+    // as it was before applyPatch. Whitespace only: a comment between the
+    // previous token and the key is never consumed.
+    while (s > 0 && /\s/.test(src[s - 1])) s--;
+  }
   if (!trailingCommaConsumed) {
     // No trailing comma → consume any leading comma + ws so the result
     // doesn't end with a dangling `, }`.

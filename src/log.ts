@@ -107,6 +107,24 @@ export function testHooksEnabled(): boolean {
   } catch { return false; }
 }
 
+// E2E-only advertiser-icon override. The closed-loop e2e (test-stack/e2e)
+// screenshot-verifies that a custom advertiser icon (the `data:` URI the
+// backend inlines from GCS — see the CSP/data-URI icon fix) actually renders
+// in the spinner overlay, NOT just the inline-"K" fallback. The debug-
+// injection ad is icon-less by default, so this env var lets the harness feed
+// a known inline icon to the debug ad. HARD-GATED to `data:image/...` URIs
+// only — never an external URL — so there is zero SSRF/exfiltration surface
+// and production (which never sets this var) is completely unaffected. Returns
+// "" when unset or not a data:image URI, in which case the ad renders the "K"
+// fallback exactly as before. Never throws.
+export function debugIconDataUri(): string {
+  try {
+    const v = process.env.KICKBACKS_E2E_ICON_DATA_URI
+      || process.env.VIBE_ADS_E2E_ICON_DATA_URI || "";
+    return /^data:image\//i.test(v) ? v : "";
+  } catch { return ""; }
+}
+
 // Rolling-trim configuration. Without this the log grows unbounded — a
 // long-lived session can produce thousands of view_tick lines an hour and
 // the file becomes unwieldy for grep + slow for the `/debug_logs`

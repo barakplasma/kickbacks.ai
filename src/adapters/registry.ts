@@ -4,6 +4,7 @@ import { readdirSync, existsSync } from "node:fs";
 import type { TargetAdapter } from "./types";
 import { ClaudeCodeAdapter } from "./claude-code/adapter";
 import { CodexAdapter } from "./codex/adapter";
+import { compareClaudeCodeInstall } from "../util/claudeCodeVersion";
 
 // Same host roots extension.ts already scans for Claude Code: local
 // (.vscode/.cursor) AND remote/server hosts (Remote-SSH, dev containers,
@@ -22,9 +23,9 @@ function envTarget(name: string): string | null | undefined {
   return existsSync(v) ? v : null;          // set => authoritative (exists or absent)
 }
 
-// Newest `<root>/<prefix>*/<...sub>` across all host roots. Highest dir name
-// wins (lexicographic on the version-suffixed dir, matching the existing CC
-// locator). Never throws.
+// Newest `<root>/<prefix>*/<...sub>` across all host roots. Highest semantic
+// Claude Code version wins; lexical ordering is only a fallback for unexpected
+// names. Never throws.
 function newestUnder(prefix: string, sub: string[]): string | null {
   for (const root of ROOTS) {
     try {
@@ -35,7 +36,7 @@ function newestUnder(prefix: string, sub: string[]): string | null {
         const p = join(root, name, ...sub);
         if (existsSync(p)) hits.push(p);
       }
-      hits.sort();
+      hits.sort(compareClaudeCodeInstall);
       if (hits.length) return hits[hits.length - 1];
     } catch { /* ignore this root */ }
   }

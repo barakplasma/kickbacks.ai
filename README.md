@@ -9,7 +9,7 @@
 ### Get paid while you code.
 
 **Kickbacks** sells the little "thinking…" word inside the Claude Code & Codex
-spinners — and pays **half of every ad dollar back to you**, the developer whose
+spinners — and pays **up to 50% of ad revenue back to you**, the developer whose
 machine showed it.
 
 [![Website](https://img.shields.io/badge/kickbacks.ai-00B894?style=for-the-badge&logoColor=white)](https://kickbacks.ai)
@@ -26,7 +26,7 @@ When Claude Code or Codex is thinking, it shows a random verb — *"Discombobula
 *"Baking…"*, *"Percolating…"*. Cute, but it's prime real estate doing nothing.
 
 Kickbacks turns that one line into a tiny, tasteful, **clickable** sponsored slot.
-Advertisers bid for it in an open auction. You get **50% of every dollar** they spend
+Advertisers bid for it in an open auction. You get **up to 50% of ad revenue**
 — credited automatically, per impression and per click.
 
 ```diff
@@ -46,26 +46,10 @@ Kickbacks  ($0.42 today · $7.11)
 - **Advertisers buy blocks.** One block = **1,000 five-second impressions**. They set
   a price per block and an ad creative, then buy as many blocks as they want.
 - **An English-ascending auction** decides whose ad shows where, and when.
-- **50 / 50 split.** Half of every settled dollar accrues to the developer whose
+- **Revenue share.** Up to 50% of ad revenue accrues to the developer whose
   editor rendered the ad. Clicks are worth **50×** an impression.
 - **Real-time balance.** Today / this month / lifetime, right in your VS Code
   status bar, with a full ledger at [kickbacks.ai](https://kickbacks.ai).
-
-## 🛡️ The Prime Directive: never break your editor
-
-This is the rule everything else bends around.
-
-- **Byte-reversible.** Patches are applied from a byte-exact backup. *Restore Claude
-  Code* from the menu reverts everything, byte-for-byte, any time.
-- **Per-version preflight.** The extension refuses to touch any build it doesn't
-  recognize. Unknown version? It does nothing. Stock verbs stay.
-- **Zero code access.** Kickbacks never reads your code, prompts, completions, or
-  chat content — only the spinner display text changes.
-- **Kill-switch.** A server-controlled global off-switch can stand the whole fleet
-  down instantly.
-
-> If Kickbacks can't find a target it's 100% sure about, it stays out of the way.
-> It will never break your editor or your terminal.
 
 ## 🎯 Where the ad shows up
 
@@ -110,10 +94,10 @@ src/
   activation/      lifecycle: ad rotation, self-update, status bar, injection
   auth/            sign-in + OS-keychain-sealed token vault
   metrics/         impression / view-threshold / click telemetry (idempotent)
-  viewTracking/    "was it actually on screen for 3s?" timer
+  viewTracking/    "was it actually on screen long enough?" timer
   killswitch/      server-controlled global off-switch
 media/             logos + icons
-test/              the vitest suite that guards the Prime Directive
+test/              the vitest suite that guards editor safety
 ```
 
 The backend, advertiser portal, auction engine, and marketing site live in a
@@ -124,7 +108,7 @@ separate private repository.
 ```bash
 npm install
 npm run build       # esbuild → dist/
-npm test            # vitest — the safety net for the Prime Directive
+npm test            # vitest — the editor-safety net
 npm run package     # produce the .vsix
 ```
 
@@ -133,9 +117,9 @@ npm run package     # produce the .vsix
 **Proprietary and source-available — _not_ open source.** © 2026 ShiftKeys, Inc.
 All rights reserved. You may read this code; you may **not** use, copy, modify,
 distribute, or commercialize it without a written license. See [LICENSE](LICENSE).
-Commercial inquiries: **andrew@shiftkeys.ai**.
+Commercial inquiries: **support@kickbacks.ai**.
 
 <div align="center">
 <br>
-<sub>Made with caffeine by <a href="https://kickbacks.ai">ShiftKeys</a> · half the ad money is yours.</sub>
+<sub>Made with caffeine by <a href="https://kickbacks.ai">ShiftKeys</a> · up to half the ad revenue is yours.</sub>
 </div>

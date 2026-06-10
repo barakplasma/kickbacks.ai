@@ -128,7 +128,33 @@ describe("cliAd cache", () => {
   it("readCliAdCache returns null when absent", () => {
     expect(readCliAdCache(tmp())).toBeNull();
   });
+  it("writeCliAdCache strips control chars (ESC/OSC/BEL/CSI) from every persisted field", () => {
+    const home = tmp();
+    const ESC = "\u001b", BEL = "\u0007", CSI = "\u009b";
+    writeCliAdCache(home, {
+      adText: "Acme" + ESC + "]8;;https://evil" + BEL + " deploys" + CSI + "31m",
+      iconRef: "i" + ESC, iconUrl: "u" + BEL,
+      clickUrl: "https://a/x" + ESC + "]8;;" });
+    const c = readCliAdCache(home);
+    expect(c?.adText).toBe("Acme]8;;https://evil deploys31m");
+    expect(c?.iconRef).toBe("i");
+    expect(c?.iconUrl).toBe("u");
+    expect(c?.clickUrl).toBe("https://a/x]8;;");
+  });
+  it("writeCliAdCache is PERMISSIVE: emoji/pipes/unicode/URLs round-trip byte-identical", () => {
+    const home = tmp();
+    const line = "Déployez 🚀 | ai.dev — détails: https://a/?q=1&r=2";
+    writeCliAdCache(home, { adText: line, iconRef: "i", iconUrl: "",
+      clickUrl: "https://a/x" });
+    expect(readCliAdCache(home)?.adText).toBe(line);
+  });
 });
+
+// Transcript line tagged with a CC `entrypoint` ("cli" = terminal session,
+// "claude-vscode" = the VS Code panel's own; untagged = older CC builds).
+const taggedRec = (entrypoint: string): string =>
+  JSON.stringify({ type: "user",
+    message: { role: "user", content: "hi" }, entrypoint }) + "\n";
 
 describe("cliSessionActive", () => {
   it("true when a recent transcript exists in <projectsRoot>", () => {
@@ -147,6 +173,37 @@ describe("cliSessionActive", () => {
   });
   it("false when projects root is absent", () => {
     expect(cliSessionActive(Date.now(), FRESH_MS, join(tmp(), "nope"))).toBe(false);
+  });
+  // Audit #30: the VS Code panel writes the SAME tree (entrypoint
+  // "claude-vscode") — editor turns must not count as a live CLI session,
+  // else statusline/spinner impressions are recorded for an unrendered surface.
+  it("false when the only recent transcript is the VS Code panel's own", () => {
+    const root = tmp();
+    const proj = join(root, "p1"); mkdirSync(proj, { recursive: true });
+    writeFileSync(join(proj, "s.jsonl"), taggedRec("claude-vscode"));
+    expect(cliSessionActive(Date.now(), FRESH_MS, root)).toBe(false);
+  });
+  it("true for a recent genuine terminal-CLI transcript (entrypoint cli)", () => {
+    const root = tmp();
+    const proj = join(root, "p1"); mkdirSync(proj, { recursive: true });
+    writeFileSync(join(proj, "s.jsonl"), taggedRec("cli"));
+    expect(cliSessionActive(Date.now(), FRESH_MS, root)).toBe(true);
+  });
+  it("true when a recent CLI transcript coexists with a recent vscode one", () => {
+    const root = tmp();
+    const proj = join(root, "p1"); mkdirSync(proj, { recursive: true });
+    writeFileSync(join(proj, "vscode.jsonl"), taggedRec("claude-vscode"));
+    writeFileSync(join(proj, "cli.jsonl"), taggedRec("cli"));
+    expect(cliSessionActive(Date.now(), FRESH_MS, root)).toBe(true);
+  });
+  it("false when the CLI transcript is stale and only the vscode one is recent", () => {
+    const root = tmp();
+    const proj = join(root, "p1"); mkdirSync(proj, { recursive: true });
+    writeFileSync(join(proj, "vscode.jsonl"), taggedRec("claude-vscode"));
+    const cli = join(proj, "cli.jsonl"); writeFileSync(cli, taggedRec("cli"));
+    const old = (Date.now() - FRESH_MS - 60_000) / 1000;
+    utimesSync(cli, old, old);
+    expect(cliSessionActive(Date.now(), FRESH_MS, root)).toBe(false);
   });
 });
 
@@ -193,6 +250,32 @@ describe("statusline.asset script", () => {
     const cache = join(d, "cli-ad.json");
     writeFileSync(cache, "{ not json");
     expect(runScript(renderScript(cache, FRESH_MS)).trim()).toBe("");
+  });
+  it("strips control bytes from adText/clickUrl before the OSC 8 wrap (defense-in-depth vs tampered cache)", () => {
+    const d = tmp();
+    const cache = join(d, "cli-ad.json");
+    const ESC = "\u001b", BEL = "\u0007";
+    // Bypass writeCliAdCache: simulate a tampered/legacy cache carrying raw
+    // escape bytes in BOTH fields (write boundary defeated).
+    writeFileSync(cache, JSON.stringify({
+      adText: "Acme" + ESC + "]8;;https://evil" + ESC + "\\spoof" + BEL,
+      iconRef: "i", iconUrl: "",
+      clickUrl: "https://acme/x" + ESC + "]8;;", ts: Date.now() }));
+    const out = runScript(renderScript(cache, FRESH_MS));
+    // The ONLY escapes emitted are the script's own 4 OSC 8 framing bytes…
+    expect(out.split(ESC).length - 1).toBe(4);
+    // …the injected sequences survive only as inert de-escaped text.
+    expect(out).toContain("ad· Acme]8;;https://evil\\spoof");
+    expect(out).toContain(ESC + "]8;;https://acme/x]8;;" + ESC + "\\");
+  });
+  it("passes emoji / pipes / unicode through byte-identical (strip is control-chars ONLY)", () => {
+    const d = tmp();
+    const cache = join(d, "cli-ad.json");
+    const line = "Déployez 🚀 | ai.dev — vite";
+    writeFileSync(cache, JSON.stringify({ adText: line, iconRef: "i",
+      iconUrl: "", clickUrl: "https://acme/x", ts: Date.now() }));
+    const out = runScript(renderScript(cache, FRESH_MS));
+    expect(out).toContain("ad· " + line);
   });
 });
 

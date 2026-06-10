@@ -76,10 +76,19 @@
       && __VIBE_ADS_VIEW_THRESHOLD_MS__ > 0)
       ? __VIBE_ADS_VIEW_THRESHOLD_MS__ : 15000;
     var TICK_MS = 5000;
-    // MAX_SESSION_MS billing cap: fire `error_impression` at EVERY
-    // multiple of this elapsed mark. See claude-code/block.asset.js for
-    // the full rationale.
-    var MAX_SESSION_MS = 5000;
+    // MAX_SESSION_MS billing cap. Pinned to THRESHOLD_MS (was a hard 5000)
+    // so the 15s `view_threshold_met` fires FIRST and becomes the billing
+    // path; the moment it fires the mutex (errorImpressionCount===0 check)
+    // suppresses error_impression for the rest of the session. Previously
+    // cap(5s) < threshold(15s) forced EVERY codex view down the
+    // error_impression path — and because cooldown_view_seconds is also 5s
+    // (and the codex block never got the c22c9aa client-side
+    // view_tick/error_impression sync), a long-lived or backgrounded codex
+    // panel billed a phantom error_impression (tier_error_impression_micros,
+    // ~$0.01) roughly every 5s indefinitely, up to the per-user daily cap.
+    // With cap===threshold, error_impression is now only a genuine fallback
+    // (fires solely if threshold_met somehow didn't). See fixes #1/#3 below.
+    var MAX_SESSION_MS = THRESHOLD_MS;
     var SESSION_NONCE = (function () {
       try {
         return (Math.random().toString(36).slice(2)
@@ -93,21 +102,50 @@
       var k = vtKey(adId, surface);
       var s = _vt[k];
       if (!s) {
-        // Sticky sessionStartedAt — repeat viewShow() with same nonce
-        // does NOT restart the baseline. errorImpressionCount tracks
-        // how many error_impressions have fired; the next one fires at
-        // `(count+1) * MAX_SESSION_MS`.
+        // Sticky sessionStartedAt — repeat viewShow() with same nonce does
+        // NOT restart the baseline. `paused`/`pausedAt` carry fix #3 (freeze
+        // while the webview is hidden). The session is ENDED (not merely
+        // hidden) when the overlay drops at idle — see viewEnd / dropOverlay.
         _vt[k] = { adId: adId, surface: surface,
           sessionNonce: SESSION_NONCE,
           sessionStartedAt: Date.now(),
           lastTickMs: 0, thresholdMet: false,
-          errorImpressionCount: 0 };
+          errorImpressionCount: 0,
+          paused: false, pausedAt: 0 };
       }
     }
+    // Fix #1: END a view session outright (used when the overlay drops at
+    // idle). The old viewHide was a no-op, so once viewShow created a session
+    // the 250ms viewTick kept accumulating elapsed time FOREVER — even after
+    // the ad left the screen — which is exactly the 31-minute "stuck" codex
+    // session that spammed error_impression. Removing the record stops the
+    // accumulator; a later paint() calls viewShow() again for a FRESH session.
+    function viewEnd(adId, surface) {
+      try { delete _vt[vtKey(adId, surface)]; } catch (e) {}
+    }
     function viewHide(_adId, _surface) {
-      // No-op under absolute-epoch baseline (see claude-code/block.asset.js).
+      // No-op kept for call-site compatibility; real teardown is viewEnd().
     }
     function viewMaybeEmit(s) {
+      // Fix #3: a hidden Codex webview must NOT accrue view-time. (The Claude
+      // adapter deliberately keeps counting when hidden under its absolute-
+      // epoch model; Codex does the opposite — a backgrounded panel was the
+      // other half of the phantom-billing loop.) While document.hidden we
+      // freeze: mark paused (stamping pausedAt once) and emit nothing. On the
+      // next visible poll we shift sessionStartedAt forward by the hidden gap
+      // so off-screen time is excluded from elapsed, then resume mid-session
+      // (lastTickMs / errorImpressionCount untouched, so cadence continues).
+      var hidden = false;
+      try { hidden = (typeof document.hidden === "boolean") && document.hidden; }
+      catch (e) { hidden = false; }
+      if (hidden) {
+        if (!s.paused) { s.paused = true; s.pausedAt = Date.now(); }
+        return;
+      }
+      if (s.paused) {
+        s.sessionStartedAt += Math.max(0, Date.now() - (s.pausedAt || Date.now()));
+        s.paused = false; s.pausedAt = 0;
+      }
       var elapsed = Math.max(0, Date.now() - s.sessionStartedAt);
       var tickFired = false;
       while (elapsed - s.lastTickMs >= TICK_MS) {
@@ -121,9 +159,11 @@
           + "&event_uuid=" + encodeURIComponent(tickEventUuid);
         ping("view_tick" + q);
       }
-      // Mutex: threshold_met only fires when no error_impression has
-      // fired this session. With default cap=5s/threshold=15s this
-      // means threshold_met effectively never fires for Codex either.
+      // Mutex: threshold_met fires once per session, and only when no
+      // error_impression has fired yet. With cap===threshold (fix #2) the
+      // threshold check runs first at elapsed>=THRESHOLD_MS and wins, so
+      // threshold_met is now the PRIMARY billing path for codex (it used to
+      // never fire because the 5s cap tripped error_impression first).
       if (!s.thresholdMet && s.errorImpressionCount === 0
           && elapsed >= THRESHOLD_MS) {
         s.thresholdMet = true;
@@ -171,10 +211,12 @@
         return Math.max(0, Date.now() - s.sessionStartedAt);
       } catch (e) { return 0; }
     }
-    // visibilitychange flush removed: under the absolute-epoch baseline a
-    // hidden webview keeps counting. The mutex (one bill per session) +
-    // server-side cooldown gate bound the worst case to one bill per ad
-    // per cooldown window.
+    // Hidden-webview accounting (fix #3): unlike the Claude adapter, a hidden
+    // Codex panel does NOT keep counting — viewMaybeEmit pauses the
+    // accumulator while document.hidden is true and resumes (shifting the
+    // baseline past the hidden gap) when it's shown again. The 250ms poll
+    // observes the visibility flip within a tick, so no separate
+    // visibilitychange listener is needed.
 
     var FG = "var(--vscode-foreground,currentColor)";
     var DIM = "var(--vscode-descriptionForeground,currentColor)";
@@ -369,7 +411,11 @@
       } catch (e) {}
     }
     function dropOverlay() {
-      try { viewHide(AD, "codex_overlay"); } catch (e) {}
+      // Fix #1: END the view session (was a no-op viewHide) so the
+      // accumulator stops the instant the ad leaves the screen at idle,
+      // instead of ticking off-screen forever. _sent reset below means the
+      // next turn opens a fresh impression session.
+      try { viewEnd(AD, "codex_overlay"); } catch (e) {}
       try { if (overlay && overlay.parentNode)
         overlay.parentNode.removeChild(overlay); } catch (e) {}
       overlay = null; lastRow = null; _rect = ""; _shown = false; _sent = false;

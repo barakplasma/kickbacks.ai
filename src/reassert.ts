@@ -2,16 +2,21 @@
  *  tick. The extension reapplies the block on an interval so a Claude Code
  *  self-update / relaunch that silently overwrites index.js is healed without
  *  the user doing a manual reload — but ONLY while the extension is healthy:
- *  signed in, an ad in hand, and not kill-switched. Pure; the single source
- *  of truth for the reassert health gate. applyPatch itself is idempotent
- *  (writes only when the file actually drifted), so a steady state is a
- *  cheap no-op and this never fights the kill-switch (gated on `killed`). */
+ *  an ad in hand and not kill-switched. Pure; the single source of truth for
+ *  the reassert health gate. applyPatch itself is idempotent (writes only when
+ *  the file actually drifted), so a steady state is a cheap no-op and this
+ *  never fights the kill-switch (gated on `killed`).
+ *
+ *  Sign-in is intentionally NOT part of the gate: a signed-out user holding a
+ *  DEMO ad must reassert too, so the preview self-heals like the real product.
+ *  `haveAd` already implies an ad is in hand (real or demo) — when signed out
+ *  with no demo ad it is false, so the prior signed-out behaviour is preserved.
+ */
 export function shouldReassert(s: {
-  signedIn: boolean;
   haveAd: boolean;
   killed: boolean;
 }): boolean {
-  return s.signedIn && s.haveAd && !s.killed;
+  return s.haveAd && !s.killed;
 }
 
 /** Tiered self-heal policy for the "patched file on disk but the webview

@@ -114,6 +114,30 @@ describe("CodexCliWrapperAdapter — Windows .cmd shim", () => {
     expect(readFileSync(adFile, "utf8").trim()).toBe("Second Ad");
   });
 
+  it("applyPatch strips control chars from the ad file (wrappers print it raw to the terminal)", () => {
+    const { home, shim, adFile } = setup();
+    const a = new CodexCliWrapperAdapter(shim, home);
+    const ESC = "\u001b", BEL = "\u0007";
+    a.applyPatch(patchParams({
+      adText: "Evil" + ESC + "]0;pwned" + BEL + ESC + "[31mAd" }));
+    expect(readFileSync(adFile, "utf8")).toBe("Evil]0;pwned[31mAd\n");
+  });
+
+  it("applyPatch is PERMISSIVE: emoji/pipes/unicode written byte-identical", () => {
+    const { home, shim, adFile } = setup();
+    const a = new CodexCliWrapperAdapter(shim, home);
+    const line = "Déployez 🚀 | ai.dev — vite";
+    a.applyPatch(patchParams({ adText: line }));
+    expect(readFileSync(adFile, "utf8")).toBe(line + "\n");
+  });
+
+  it("applyPatch falls back to the default line when adText strips to empty", () => {
+    const { home, shim, adFile } = setup();
+    const a = new CodexCliWrapperAdapter(shim, home);
+    a.applyPatch(patchParams({ adText: "\u001b\u0007" }));
+    expect(readFileSync(adFile, "utf8")).toBe("Earning Kickback\n");
+  });
+
   it("restore: byte-exact restoration of the npm shim", () => {
     const { home, shim, backup, adFile } = setup();
     const a = new CodexCliWrapperAdapter(shim, home);

@@ -2,7 +2,7 @@
   "name": "kickbacks-ai",
   "displayName": "Kickbacks.ai",
   "publisher": "Kickbacksai",
-  "version": "0.3.141",
+  "version": "0.3.168",
   "description": "Get paid while you code. Subtle, clickable ads in the Claude Code and Codex spinners — 50/50 revenue split to users.",
   "icon": "media/icon.png",
   "repository": {
@@ -41,6 +41,14 @@
       {
         "command": "kickbacks.editConfig",
         "title": "Kickbacks: Edit Config"
+      },
+      {
+        "command": "kickbacks.diagnose",
+        "title": "Kickbacks: Diagnose"
+      },
+      {
+        "command": "vibe-ads.diagnose",
+        "title": "Kickbacks: Diagnose (legacy alias)"
       },
       {
         "command": "vibe-ads.signIn",
@@ -203,13 +211,13 @@
     "vitest": "2.0.5"
   },
   "author": {
-    "name": "Andrew McCalip",
-    "url": "https://github.com/andrewmccalip"
+    "name": "ShiftKeys, Inc.",
+    "url": "https://kickbacks.ai"
   },
   "license": "SEE LICENSE IN LICENSE",
   "homepage": "https://kickbacks.ai",
   "bugs": {
-    "url": "https://github.com/andrewmccalip/kickbacks/issues"
+    "url": "https://github.com/andrewmccalip/kickbacks.ai/issues"
   },
   "keywords": [
     "claude-code",

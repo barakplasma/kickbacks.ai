@@ -1,23 +1,26 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { Loopback, type LoopbackAdPayload } from "../src/loopback";
-import { PortfolioClient, type PatchAd } from "../src/portfolio/client";
+import { PortfolioClient, type PatchAd,
+  type PortfolioResponse } from "../src/portfolio/client";
+import { setupAdRotation, clearAdRotationOnSignOut,
+  type AdRotationDeps } from "../src/activation/adRotation";
 
 const AD_LINEAR: PatchAd = {
-  adId: "ad-linear", campaignId: "c-linear", seat: "s1",
+  adId: "ad-linear", campaignId: "c-linear",
   adText: "Linear -- plan, build, ship", iconRef: "icon.linear",
   iconUrl: "https://icons.test/linear.png", clickUrl: "https://linear.app",
   bannerEnabled: false, sessionToken: "tok-linear",
 };
 
 const AD_RAILWAY: PatchAd = {
-  adId: "ad-railway", campaignId: "c-railway", seat: "s2",
+  adId: "ad-railway", campaignId: "c-railway",
   adText: "Railway -- deploy in seconds", iconRef: "icon.railway",
   iconUrl: "https://icons.test/railway.png", clickUrl: "https://railway.app",
   bannerEnabled: false, sessionToken: "tok-railway",
 };
 
 const AD_WARP: PatchAd = {
-  adId: "ad-warp", campaignId: "c-warp", seat: "s3",
+  adId: "ad-warp", campaignId: "c-warp",
   adText: "Warp -- the terminal reimagined", iconRef: "icon.warp",
   iconUrl: "https://icons.test/warp.png", clickUrl: "https://warp.dev",
   bannerEnabled: false, sessionToken: "tok-warp",
@@ -230,6 +233,155 @@ describe("rotation index cycling", () => {
 
     expect(rotationIdx).toBe(0);
     expect(firstAd.adId).toBe("ad-warp");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Real setupAdRotation wiring: sign-out clear (audit #20) and the refresh
+// epoch that discards stale in-flight portfolio responses (audit #32).
+// ---------------------------------------------------------------------------
+function mkResp(ads: PatchAd[]): PortfolioResponse {
+  return { ad: ads[0] ?? null, ads, queueId: "q", ttlMs: 60_000,
+    rotationIntervalMs: 120_000, viewThresholdMs: 3_000, balances: null };
+}
+
+function mkRotationDeps(opts: {
+  token?: () => string | null;
+  fetchPortfolio?: () => Promise<PortfolioResponse | null>;
+  fetchDemoPortfolio?: () => Promise<PortfolioResponse | null>;
+  initialAd?: PatchAd;
+} = {}) {
+  const timers: NodeJS.Timeout[] = [];
+  const adRef = { current: (opts.initialAd ?? null) as PatchAd | null };
+  const activeAdRef = { current: (opts.initialAd ?? null) as PatchAd | null };
+  const applyPatch = vi.fn(() => ({ ok: true }));
+  const sessionSet = vi.fn();
+  const deps = {
+    adapter: { applyPatch, isPatched: () => true,
+               preflight: () => ({ compatible: true }), restore: () => {} },
+    portfolio: { fetchPortfolio: opts.fetchPortfolio ?? (async () => null),
+                 fetchDemoPortfolio: opts.fetchDemoPortfolio ?? (async () => null) },
+    auth: { accessToken: opts.token ?? (() => "tok"), clientId: () => "cid" },
+    debugCtl: { setPortfolioAd: vi.fn() },
+    session: { set: sessionSet },
+    ccVersion: "2.1.167",
+    port: 12345,
+    patchParams: { adText: "", iconRef: "", iconUrl: "", clickUrl: "" },
+    activeAdRef,
+    corrRef: { current: "corr" },
+    adRef,
+    impDedupe: { reset: vi.fn() },
+    reapplyCodex: null,
+    timers,
+  } as unknown as AdRotationDeps;
+  return { deps, timers, adRef, activeAdRef, applyPatch, sessionSet };
+}
+
+describe("sign-out clear (audit #20)", () => {
+  it("clear() empties the queue, nulls the shared ad refs, and disarms rotation", () => {
+    const { deps, timers, adRef, activeAdRef, sessionSet } =
+      mkRotationDeps({ initialAd: AD_LINEAR });
+    try {
+      const handle = setupAdRotation(deps, mkResp([AD_LINEAR, AD_RAILWAY]));
+      expect(handle.rotationTimer).not.toBeNull(); // 2 ads ⇒ rotation armed
+
+      handle.clear();
+
+      expect(handle.adQueue).toEqual([]);
+      expect(handle.rotationTimer).toBeNull();
+      expect(adRef.current).toBeNull();
+      expect(activeAdRef.current).toBeNull();
+      expect(sessionSet).toHaveBeenCalledWith({ hasAd: false });
+    } finally { timers.forEach((t) => clearInterval(t)); }
+  });
+
+  it("rotation never re-patches CC after clear() (the sign-out re-patch bug)", () => {
+    vi.useFakeTimers();
+    const { deps, timers, applyPatch } = mkRotationDeps({
+      initialAd: AD_LINEAR, token: () => null });
+    try {
+      const handle = setupAdRotation(deps, mkResp([AD_LINEAR, AD_RAILWAY]));
+      handle.clear();
+      applyPatch.mockClear();
+      // Pre-fix the still-armed 120s rotation timer applied the leftover REAL
+      // ad — re-patching CC right after doSignOut had restored it.
+      vi.advanceTimersByTime(10 * 120_000);
+      expect(applyPatch).not.toHaveBeenCalled();
+    } finally {
+      timers.forEach((t) => clearInterval(t));
+      vi.useRealTimers();
+    }
+  });
+
+  it("clearAdRotationOnSignOut() reaches the live rotation (module hook)", () => {
+    const { deps, timers, adRef } = mkRotationDeps({ initialAd: AD_LINEAR });
+    try {
+      const handle = setupAdRotation(deps, mkResp([AD_LINEAR]));
+      clearAdRotationOnSignOut();
+      expect(handle.adQueue).toEqual([]);
+      expect(adRef.current).toBeNull();
+    } finally { timers.forEach((t) => clearInterval(t)); }
+  });
+
+  it("clear() discards an in-flight refresh — a late response can't resurrect ads", async () => {
+    let resolveReal!: (r: PortfolioResponse | null) => void;
+    const pending = new Promise<PortfolioResponse | null>((res) => { resolveReal = res; });
+    const { deps, timers, adRef } = mkRotationDeps({
+      initialAd: AD_LINEAR, token: () => "tok", fetchPortfolio: () => pending });
+    try {
+      const handle = setupAdRotation(deps, mkResp([AD_LINEAR]));
+      const inflight = handle.refreshNow(false); // fetch in flight…
+      handle.clear();                            // …sign-out lands mid-flight
+      resolveReal(mkResp([AD_RAILWAY]));         // stale response arrives late
+      await inflight;
+      expect(adRef.current).toBeNull();
+      expect(handle.adQueue).toEqual([]);
+    } finally { timers.forEach((t) => clearInterval(t)); }
+  });
+
+  it("the next (demo) portfolio apply re-populates the queue and re-arms rotation", async () => {
+    let token: string | null = "tok";
+    const { deps, timers, adRef } = mkRotationDeps({
+      initialAd: AD_LINEAR, token: () => token,
+      fetchDemoPortfolio: async () => mkResp([AD_RAILWAY, AD_WARP]) });
+    try {
+      const handle = setupAdRotation(deps, mkResp([AD_LINEAR]));
+      handle.clear();
+      token = null;                   // signed out now
+      await handle.refreshNow(false); // the 60s refresh-timer path
+      expect(adRef.current?.adId).toBe("ad-railway");
+      expect(handle.adQueue).toHaveLength(2);
+      expect(handle.rotationTimer).not.toBeNull();
+    } finally { timers.forEach((t) => clearInterval(t)); }
+  });
+});
+
+describe("stale in-flight refresh epoch (audit #32)", () => {
+  it("a DEMO fetch resolving after the forced sign-in swap is discarded", async () => {
+    let token: string | null = null;
+    let resolveDemo!: (r: PortfolioResponse | null) => void;
+    const demoPending = new Promise<PortfolioResponse | null>(
+      (res) => { resolveDemo = res; });
+    const { deps, timers, adRef, activeAdRef } = mkRotationDeps({
+      initialAd: AD_LINEAR, token: () => token,
+      fetchDemoPortfolio: () => demoPending,
+      fetchPortfolio: async () => mkResp([AD_WARP]) });
+    try {
+      const handle = setupAdRotation(deps, mkResp([AD_LINEAR]));
+      const inflight = handle.refreshNow(false); // signed-out demo fetch (slow)
+      token = "tok";                             // sign-in completes mid-flight
+      await handle.refreshNow(true);             // forced real-ad swap
+      expect(adRef.current?.adId).toBe("ad-warp");
+
+      resolveDemo(mkResp([AD_RAILWAY]));         // stale demo response lands
+      await inflight;
+
+      // Pre-fix the late demo response force-applied AD_RAILWAY (demo ads +
+      // demo tokens) over the just-applied real ad on a signed-in client.
+      expect(adRef.current?.adId).toBe("ad-warp");
+      expect(activeAdRef.current?.adId).toBe("ad-warp");
+      expect(handle.lastAdSetSig).toBe("ad-warp");
+    } finally { timers.forEach((t) => clearInterval(t)); }
   });
 });
 

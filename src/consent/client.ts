@@ -1,3 +1,5 @@
+import { timeoutFetch } from "../util/http";
+
 type Fetch = typeof fetch;
 
 export interface ConsentState {
@@ -12,7 +14,10 @@ export class ConsentClient {
   constructor(
     private base: string,
     private token: () => string | null,
-    private f: Fetch = fetch,
+    // audit-2026-06-09 #38: was bare `fetch` — the only client whose DEFAULT
+    // bypassed the 2A-01 timeout wrapper. Consent is two tiny calls; 30s is
+    // a generous budget for the user-blocking Agree POST.
+    private f: Fetch = timeoutFetch(30000),
   ) {}
 
   async read(): Promise<ConsentState | null> {

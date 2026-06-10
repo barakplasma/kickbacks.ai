@@ -18,11 +18,15 @@ import { join } from "node:path";
 // Mock the log module so "signed in" assertions reflect real token state and
 // tests never read dev-machine sentinels. Same trick auth.test.ts uses.
 vi.mock("../src/log", () => ({ debugEnabled: () => false, dlog: () => {},
-  dlogRaw: () => {}, codexEnabled: () => false, codexCliEnabled: () => false,
+  dlogRaw: () => {}, debugIconDataUri: () => "",
+  codexEnabled: () => false, codexCliEnabled: () => false,
   testHooksEnabled: () => false,
   LOG_PATH: "/tmp/test-log" }));
 
 import { activate, deactivate, __wireForTest } from "../src/extension";
+import { setupAdRotation, type AdRotationDeps }
+  from "../src/activation/adRotation";
+import type { PatchAd, PortfolioResponse } from "../src/portfolio/client";
 import {
   makeContext, secrets, _opened, _shown, _openedDocs, commands, window,
 } from "./mocks/vscode";
@@ -219,6 +223,64 @@ describe("kickbacks.signOut", () => {
       expect(t.statusBar.set).toHaveBeenCalledWith(
         expect.objectContaining({ kind: "signed-out" }));
     } finally { await t.dispose(); }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression (audit #20): sign-out must clear the live ad-rotation state.
+// Pre-fix, doSignOut restored the CC files but left the REAL ad in adRef and
+// the rotation queue — the status bar kept serving it signed-out, the next
+// rotation tick re-patched CC right after the restore, and metrics misrouted
+// the real session tokens to /v1/metrics/demo.
+// ---------------------------------------------------------------------------
+describe("kickbacks.signOut → ad-rotation clear", () => {
+  const mkAd = (adId: string): PatchAd => ({
+    adId, campaignId: "c-" + adId, adText: "Ad " + adId, iconRef: "i",
+    iconUrl: "", clickUrl: "https://x.test", bannerEnabled: false,
+    sessionToken: "tok-" + adId });
+  const mkResp = (ads: PatchAd[]): PortfolioResponse => ({
+    ad: ads[0] ?? null, ads, queueId: "q", ttlMs: 60_000,
+    rotationIntervalMs: 120_000, viewThresholdMs: 3_000, balances: null });
+
+  it("drops the leftover real ads from the live rotation on sign-out", async () => {
+    const t = await boot();
+    const timers: NodeJS.Timeout[] = [];
+    try {
+      await commands.executeCommand("kickbacks.signIn");
+      // Stand up a live rotation holding REAL ads. The hermetic boot serves
+      // no ad (stub portfolio is empty) so activation never created one —
+      // this registers as THE live rotation the sign-out command must reach.
+      const ads = [mkAd("real-1"), mkAd("real-2")];
+      const adRef = { current: ads[0] as PatchAd | null };
+      const activeAdRef = { current: ads[0] as PatchAd | null };
+      const deps = {
+        adapter: { applyPatch: vi.fn(() => ({ ok: true })) },
+        portfolio: { fetchPortfolio: async () => null,
+                     fetchDemoPortfolio: async () => null },
+        auth: { accessToken: () => "tok", clientId: () => "cid" },
+        debugCtl: { setPortfolioAd: vi.fn() },
+        session: { set: vi.fn() },
+        ccVersion: "2.1.167", port: 12345,
+        patchParams: { adText: "", iconRef: "", iconUrl: "", clickUrl: "" },
+        activeAdRef, corrRef: { current: "corr" }, adRef,
+        impDedupe: { reset: vi.fn() }, reapplyCodex: null, timers,
+      } as unknown as AdRotationDeps;
+      const handle = setupAdRotation(deps, mkResp(ads));
+      expect(handle.rotationTimer).not.toBeNull();
+
+      await commands.executeCommand("kickbacks.signOut");
+
+      // The command path must clear the rotation: queue gone, timer disarmed,
+      // shared ad refs nulled — no surface can keep serving the real ad
+      // signed-out and no rotation tick can re-patch CC post-restore.
+      expect(handle.adQueue).toEqual([]);
+      expect(handle.rotationTimer).toBeNull();
+      expect(adRef.current).toBeNull();
+      expect(activeAdRef.current).toBeNull();
+    } finally {
+      timers.forEach((tm) => clearInterval(tm));
+      await t.dispose();
+    }
   });
 });
 

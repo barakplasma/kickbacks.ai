@@ -77,7 +77,16 @@ export class TestHooks {
     private readonly portfolio: PortfolioClient,
     private readonly earnings: EarningsClient,
     private readonly getContext: () => TestHooksContext,
+    private readonly onBillableEvent: (() => void) | null = null,
   ) {}
+
+  private scheduleRefreshFor(event: MetricEvent): void {
+    if (event !== "view_threshold_met" && event !== "click"
+        && event !== "impression_viewable" && event !== "error_impression") {
+      return;
+    }
+    try { this.onBillableEvent?.(); } catch { /* test hooks must not disrupt */ }
+  }
 
   private resolveAd(args: FireArgs): { adId: string; campaignId: string; sessionToken: string } | null {
     if (args.adId && args.campaignId) {
@@ -145,6 +154,7 @@ export class TestHooks {
     this.recordSent(sent);
     dlog("ext", "testhook.fire", { event, eventUuid,
       adId: resolved.adId, surface, corr });
+    this.scheduleRefreshFor(event);
     return { ok: true, sent };
   }
 
@@ -219,6 +229,7 @@ export class TestHooks {
     this.recordSent(sent);
     dlog("ext", "testhook.click", { ct: args.ct || "test", eventUuid,
       adId: resolved.adId, surface, corr });
+    this.scheduleRefreshFor("click");
     return { ok: true, sent };
   }
 

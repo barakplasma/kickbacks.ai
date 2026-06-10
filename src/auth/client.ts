@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { readFileSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { createVault, type SecretVault } from "./vault";
 import { dlog } from "../log";
+import { isLoopbackBase } from "../util/loopback";
+import { timeoutFetch } from "../util/http";
 
 type Fetch = typeof fetch;
 // kickbacks.* are the current keys; vibe-ads.* are legacy (pre-W1-rename)
@@ -44,6 +46,13 @@ export class AuthClient {
   // success. That race is the most likely cause of "signed out after a
   // self-update restart".
   private refreshInFlight: Promise<boolean> | null = null;
+  // Single-flight guard for the INTERACTIVE flow (mirrors refreshInFlight):
+  // a second "Sign in" click while the browser tab is still loading must
+  // join the in-flight flow, not mint a second `state` + parallel 3-minute
+  // poll loop that ends in a false "timed out" toast after the user already
+  // signed in through the first one.
+  private signInInFlight: Promise<boolean> | null = null;
+  private secretsStoreWarned = false; // log keyring store failures once
   // Login trigger: fired once on a successful interactive sign-in so the
   // injection patch is reasserted immediately rather than waiting up to 60s
   // for the next reassert tick. Wired by extension.ts; no-op until then.
@@ -51,7 +60,7 @@ export class AuthClient {
   setOnSignedIn(fn: () => void): void { this.onSignedIn = fn; }
   constructor(private base: string,
               private ctx: vscode.ExtensionContext,
-              private f: Fetch = fetch,
+              private f: Fetch = timeoutFetch(15000),
               private pollMs = 1500,
               // ~/.kickbacks/auth.json is the new universal floor. If only the
               // legacy ~/.vibe-ads/auth.json exists we migrate-on-read inside
@@ -99,6 +108,24 @@ export class AuthClient {
     dlog("ext", "auth.signout", {});
   }
 
+  /** SecretStorage writes are BEST-EFFORT: a locked/absent Secret Service
+   *  (the exact keyring-less Linux env the file fallback exists for) makes
+   *  ctx.secrets.store() THROW. An unwrapped throw aborted activation from
+   *  loadCached and turned a server-side-successful refresh into a sign-out
+   *  after the rotating token was already consumed. The sealed file
+   *  (sealToFile) is the durable layer; this cache write never throws. */
+  private async storeSecret(key: string, value: string): Promise<boolean> {
+    try { await this.ctx.secrets.store(key, value); return true; }
+    catch (e) {
+      if (!this.secretsStoreWarned) {
+        this.secretsStoreWarned = true;
+        dlog("ext", "auth.secrets.store-failed",
+          { error: e instanceof Error ? e.message : String(e) });
+      }
+      return false;
+    }
+  }
+
   // --- id-independent fallback (best-effort; never throws) -----------------
   private readFallback(): Fallback {
     try { return JSON.parse(readFileSync(this.authFile, "utf8")) as Fallback; }
@@ -116,16 +143,29 @@ export class AuthClient {
   }
 
   clientId(): string {
+    const fileId = this.readFallback().clientId;
     let id = this.ctx.globalState.get<string>(CID)
       || this.ctx.globalState.get<string>(CID_LEGACY)  // W1: pre-rename users
-      || this.readFallback().clientId;
+      || fileId;
     if (!id) id = randomBytes(12).toString("hex");
     this.ctx.globalState.update(CID, id);
-    this.writeFallback({ clientId: id });   // stable across reinstall/rename
+    // Write the file ONLY when its clientId is missing/stale. This runs on
+    // EVERY metrics send; an unconditional read-merge-write of auth.json can
+    // resurrect a just-rotated refresh envelope another window sealed between
+    // our read and our write (the rotated token is single-use — clobbering it
+    // signs the user out). writeFallback re-reads at write time and merges,
+    // so the token envelope on disk is preserved, never rewritten from here.
+    if (fileId !== id) this.writeFallback({ clientId: id }); // stable across reinstall/rename
     return id;
   }
 
   async loadCached(): Promise<void> {
+    if (this.devBypassEnabled()) {
+      this.at = "dev-bypass";
+      dlog("ext", "auth.loadCached",
+        { hadAccess: true, refreshSource: "dev-bypass", signedIn: true });
+      return;
+    }
     // W1 rename: try kickbacks.* first, fall back to legacy vibe-ads.* keys.
     this.at = (await this.ctx.secrets.get(A))
       || (await this.ctx.secrets.get(A_LEGACY))
@@ -145,7 +185,7 @@ export class AuthClient {
         rt = stored;
         await this.sealToFile(rt);
       }
-      if (rt) { rtSource = "file"; await this.ctx.secrets.store(R, rt); } // re-warm
+      if (rt) { rtSource = "file"; await this.storeSecret(R, rt); } // re-warm
     }
     // No access token but we have a refresh token => re-mint silently
     // (this is what makes a reinstall NOT require a new Google sign-in).
@@ -170,18 +210,33 @@ export class AuthClient {
 
   private async persistTokens(access: string, refresh?: string): Promise<void> {
     this.at = access;
-    await this.ctx.secrets.store(A, access);
+    const stored = await this.storeSecret(A, access);
     // Keyring health probe: if the store doesn't round-trip we're in a
     // keyring-less env and the file (above-vault) is doing the real work.
-    try { this.keyringOk = (await this.ctx.secrets.get(A)) === access; }
-    catch { this.keyringOk = false; }
+    if (!stored) this.keyringOk = false;
+    else {
+      try { this.keyringOk = (await this.ctx.secrets.get(A)) === access; }
+      catch { this.keyringOk = false; }
+    }
     if (refresh) {
-      try { await this.ctx.secrets.store(R, refresh); } catch { /* cache only */ }
+      await this.storeSecret(R, refresh); // cache only
       await this.sealToFile(refresh); // ALWAYS — the durable source of truth
     }
   }
 
+  /** Interactive sign-in. Concurrent calls (double-click, palette + nudge)
+   *  are coalesced onto ONE browser tab + poll loop — a parallel loop polls
+   *  a state the user never completes and ends in a false "timed out" toast
+   *  minutes after the real flow succeeded. */
   async signIn(): Promise<boolean> {
+    if (this.signInInFlight) return this.signInInFlight;
+    const p = this._signIn();
+    this.signInInFlight = p;
+    try { return await p; }
+    finally { if (this.signInInFlight === p) this.signInInFlight = null; }
+  }
+
+  private async _signIn(): Promise<boolean> {
     try {
       // S1 contract (see tools/ext_auth_harness.py): /extension/start 307-
       // redirects to Google with `state` embedded in the Location URL. Do NOT
@@ -194,7 +249,15 @@ export class AuthClient {
       const state = new URL(loc).searchParams.get("state");
       if (!state) { dlog("ext", "auth.signin", { ok: false, reason: "no-state" }); return false; }
       await vscode.env.openExternal(vscode.Uri.parse(loc));
+      const wasSignedIn = this.signedIn();
       for (let i = 0; i < 120; i++) {
+        // Signed in through another path mid-poll (background refresh,
+        // loadCached re-mint)? Exit silently — the session is live, and an
+        // error toast after a successful sign-in reads as a broken product.
+        if (!wasSignedIn && this.signedIn()) {
+          dlog("ext", "auth.signin", { ok: true, reason: "signed-in-elsewhere" });
+          return true;
+        }
         const r = await this.f(
           `${this.base}/v1/auth/extension/poll?state=${encodeURIComponent(state)}`);
         const j = await r.json() as { status?: string; access_token?: string;
@@ -206,6 +269,10 @@ export class AuthClient {
           return true;
         }
         await new Promise((res) => setTimeout(res, this.pollMs));
+      }
+      if (!wasSignedIn && this.signedIn()) {
+        dlog("ext", "auth.signin", { ok: true, reason: "signed-in-elsewhere" });
+        return true;
       }
       dlog("ext", "auth.signin", { ok: false, reason: "timeout" });
       vscode.window.showErrorMessage(
@@ -226,6 +293,11 @@ export class AuthClient {
    *  recovered token straight in, bypassing a SecretStorage round-trip that
    *  may not have landed yet. Never throws. */
   async refresh(explicitRt?: string): Promise<boolean> {
+    if (this.devBypassEnabled()) {
+      this.at = "dev-bypass";
+      dlog("ext", "auth.refresh", { ok: true, reason: "dev-bypass" });
+      return true;
+    }
     if (this.refreshInFlight) return this.refreshInFlight;
     const p = this._refresh(explicitRt);
     this.refreshInFlight = p;
@@ -234,10 +306,18 @@ export class AuthClient {
   }
 
   private async _refresh(explicitRt?: string): Promise<boolean> {
-    // wave-2A-H1: every failure path below clears `this.at`. Pre-fix, a
-    // dead access token sat in memory until explicit signOut(); signedIn()
-    // returned true but every backend call 401'd. With at cleared on
-    // refresh failure, signedIn() flips to false at the right moment.
+    // wave-2A-H1 + audit #10: only an EXPLICIT server rejection (401/403 or
+    // an invalid_grant-style body — the session is dead) clears `this.at`,
+    // flipping signedIn() to false at the right moment. A TRANSIENT failure
+    // (network throw, timeout, 5xx) says nothing about token validity:
+    // pre-fix it nulled a possibly-valid access token and — because every
+    // refresh() caller is gated on accessToken() — one offline blip during
+    // the activation-time forced refresh demoted the whole session to demo
+    // (user-credit loss) with zero retry paths. On transient failure we keep
+    // the current tokens and return false; the next caller (60s rotation,
+    // earnings 401 retry) retries naturally. The lost-response rotation race
+    // (server rotated, reply dropped) is covered server-side by the
+    // idempotent reuse-grace window.
     try {
       // Token source order: an explicitly-handed token (load-time recovery),
       // then the fast SecretStorage cache, then the durable sealed file. The
@@ -251,6 +331,7 @@ export class AuthClient {
         else if (stored) rt = stored;
       }
       if (!rt) {
+        // No refresh token anywhere: nothing can ever re-mint this session.
         this.at = null;
         dlog("ext", "auth.refresh", { ok: false, reason: "no-token" });
         return false;
@@ -260,14 +341,21 @@ export class AuthClient {
         body: JSON.stringify({ refresh_token: rt }),
       });
       if (!r.ok) {
-        this.at = null;
-        dlog("ext", "auth.refresh", { ok: false, reason: `http-${r.status}` });
+        if (await this.isExplicitRejection(r)) {
+          this.at = null;
+          dlog("ext", "auth.refresh", { ok: false, reason: `http-${r.status}` });
+        } else {
+          // 5xx / 429 / gateway noise: the token may be fine — keep it.
+          dlog("ext", "auth.refresh",
+            { ok: false, reason: `http-${r.status}`, transient: true });
+        }
         return false;
       }
       const j = await r.json() as { access_token?: string; refresh_token?: string };
       if (!j.access_token) {
-        this.at = null;
-        dlog("ext", "auth.refresh", { ok: false, reason: "no-access-token" });
+        // A 2xx without a token is a server/proxy anomaly, not a rejection.
+        dlog("ext", "auth.refresh",
+          { ok: false, reason: "no-access-token", transient: true });
         return false;
       }
       // S1 /refresh ROTATES the refresh token (consume + reissue); persist the
@@ -276,9 +364,31 @@ export class AuthClient {
       dlog("ext", "auth.refresh", { ok: true, rotated: !!j.refresh_token });
       return true;
     } catch {
-      this.at = null;
-      dlog("ext", "auth.refresh", { ok: false, reason: "throw" });
+      // Network / DNS / timeout: transient — keep the current tokens so a
+      // later refresh can succeed (audit #10).
+      dlog("ext", "auth.refresh",
+        { ok: false, reason: "throw", transient: true });
       return false;
     }
+  }
+
+  /** An EXPLICIT auth rejection: the server saw the refresh token and refused
+   *  it. Our backend 401s a consumed/unknown token; 403 and an OAuth-style
+   *  `invalid_grant` 4xx body (defensive — proxies / future backends) also
+   *  count. Anything else non-ok (5xx, 429, gateway noise) is transient and
+   *  must NOT discard tokens. Never throws. */
+  private async isExplicitRejection(r: Response): Promise<boolean> {
+    if (r.status === 401 || r.status === 403) return true;
+    if (r.status >= 500) return false;
+    try {
+      const body = (await r.clone?.().text?.()) ?? "";
+      return /invalid_grant/i.test(body);
+    } catch { return false; }
+  }
+
+  private devBypassEnabled(): boolean {
+    const on = process.env.KICKBACKS_DEV_BYPASS === "1"
+      || process.env.VIBE_ADS_DEV_BYPASS === "1";
+    return on && isLoopbackBase(this.base);
   }
 }

@@ -51,6 +51,22 @@ describe("block.asset icon rendering (ICON_URL feature)", () => {
     expect(h).toContain('height="13"');
     expect(h).toContain("object-fit:contain");
     expect(h).not.toContain("<svg");
+    // data-va-icon marks the img for the capture-phase error→K-badge fallback.
+    expect(h).toContain('data-va-icon="1"');
+    // Inline onerror= would be CSP-blocked by CC's script-src; must not appear.
+    expect(h).not.toContain("onerror");
+  });
+
+  it("data: URI icon (the CSP-safe path) renders an <img> with that src", () => {
+    const url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==";
+    const b = load(url);
+    const h = (b.buildAdHtml as Function)(3, {
+      ad: "Acme", dots: "", elapsed: "1.2s",
+    });
+    expect(h).toContain("<img");
+    expect(h).toContain(`src="${url}"`);
+    expect(h).toContain('data-va-icon="1"');
+    expect(h).not.toContain("<svg");
   });
 
   it("icon_url with special chars is HTML-escaped in img src", () => {

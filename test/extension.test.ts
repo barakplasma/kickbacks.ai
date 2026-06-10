@@ -10,8 +10,27 @@ vi.mock("../src/log", () => ({ debugEnabled: () => false, dlog: () => {},
   testHooksEnabled: () => false,
   LOG_PATH: "/tmp/test-log" }));
 
+// Hermetic ~/.claude/settings.json: activate() wires the claude-cli
+// statusline adapter at the developer's REAL settings file — on the normal
+// path via cliSync, and (audit #22) on the incompatible early-return path.
+// Mock the adapter so test-driven activations never touch that file;
+// `cliRestore` records restore() calls for the #22 regression below.
+const cliRestore = vi.hoisted(() =>
+  vi.fn(() => ({ ok: true, restored: true })));
+vi.mock("../src/adapters/claude-cli/adapter", () => ({
+  resolveStatuslineAsset: () => "",
+  ClaudeCliStatuslineAdapter: class {
+    name = "claude-cli-statusline";
+    spinnerVerbsSupported = true;
+    version() { return "cli"; }
+    preflight() { return { ok: true, compatible: true, version: "cli" }; }
+    applyPatch() { return { ok: true }; }
+    restore = cliRestore;
+  },
+}));
+
 import { activate, deactivate, __wireForTest } from "../src/extension";
-import { makeContext } from "./mocks/vscode";
+import { makeContext, _warned } from "./mocks/vscode";
 import { ImpressionDedupe } from "../src/metrics/dedupe";
 
 it("loopback impression path dedupes per adId (one bill per ad)", () => {
@@ -39,6 +58,59 @@ describe("extension orchestration", { timeout: 15_000 }, () => {
     await expect(activate(makeContext() as never)).resolves.toBeUndefined();
     expect(adapter.applyPatch).not.toHaveBeenCalled();
     expect(sb.set).toHaveBeenCalledWith(expect.objectContaining({ kind: "incompatible" }));
+    // A non-structural reason ("x") must NOT pop the incompat warning — that's
+    // reserved for a genuine "verb array not found" miss. (Match the message,
+    // not a count: unrelated warnings — e.g. the boot canary — share the mock.)
+    expect(_warned.some((t) => t.includes("spinner hook"))).toBe(false);
+    await deactivate();
+  });
+
+  it("audit #22: incompatible/missing Claude Code still cleans the CLI"
+    + " settings surface and leaves it restorable at deactivate", async () => {
+    const adapter = {
+      name: "claude-code",
+      preflight: () => ({ ok: true, compatible: false, version: "9.9.9", reason: "x" }),
+      version: () => "9.9.9",
+      applyPatch: vi.fn(() => ({ ok: true })),
+      restore: vi.fn(() => ({ ok: true, restored: false })),
+    };
+    const sb = { set: vi.fn(), dispose() {} };
+    __wireForTest({ adapter, statusBar: sb });
+    cliRestore.mockClear();
+    await activate(makeContext() as never);
+    // Pre-fix the early return ran before ANY claude-cli adapter existed, so
+    // a stale statusLine/spinnerVerbs patch from a prior session (crash /
+    // CC uninstalled-but-terminal-CLI-kept) was stranded forever. Now it is
+    // cleaned once on this path…
+    expect(cliRestore,
+      "incompatible path must run the key-scoped CLI restore")
+      .toHaveBeenCalled();
+    // …and actx.cliStatus stays wired, so deactivate()'s (previously
+    // null-guarded-away) CLI restore still runs.
+    cliRestore.mockClear();
+    await deactivate();
+    expect(cliRestore,
+      "deactivate must still be able to restore the CLI surface")
+      .toHaveBeenCalled();
+  });
+
+  it("genuine verb-array miss -> warns the user (wiring), status incompatible", async () => {
+    const adapter = {
+      name: "claude-code",
+      preflight: () => ({ ok: true, compatible: false, version: "2.1.161",
+        reason: "verb array not found (incompatible build)" }),
+      version: () => "2.1.161",
+      isPatched: () => false,
+      applyPatch: vi.fn(() => ({ ok: true })),
+      restore: vi.fn(() => ({ ok: true, restored: false })),
+    };
+    const sb = { set: vi.fn(), dispose() {} };
+    __wireForTest({ adapter, statusBar: sb });
+    await activate(makeContext() as never);
+    expect(adapter.applyPatch).not.toHaveBeenCalled();
+    expect(_warned.some((t) =>
+      t.includes("couldn't find Claude Code 2.1.161's spinner hook")))
+      .toBe(true);
     await deactivate();
   });
 

@@ -5,7 +5,8 @@ import type { TargetAdapter, PreflightResult, OpResult, RestoreResult,
               PatchParams } from "../types";
 import { sha256 } from "../../util/crypto";
 import { resolveAsset } from "../../util/asset";
-import { parseable, upsertStatusLine, upsertSpinnerVerbs, removeSpinnerVerbs }
+import { parseable, upsertStatusLine, upsertSpinnerVerbs, removeSpinnerVerbs,
+         removeTopLevel }
   from "./settingsEdit";
 
 const ABSENT = " VIBE-ADS-ABSENT";
@@ -108,7 +109,12 @@ export class ClaudeCliStatuslineAdapter implements TargetAdapter {
         writeFileSync(this.backupPath(),
           pristine === null ? ABSENT : pristine, "utf8");
       mkdirSync(this.vibeDir(), { recursive: true });
-      writeFileSync(this.scriptPath(), this.renderScript(), "utf8");
+      const script = this.renderScript();
+      // Idempotent: cliSync re-applies every 60s — skip the write when the
+      // on-disk script is already byte-identical (no per-tick disk churn).
+      if (!existsSync(this.scriptPath())
+          || readFileSync(this.scriptPath(), "utf8") !== script)
+        writeFileSync(this.scriptPath(), script, "utf8");
 
       const base = pristine ?? "{\n}\n";
       let next = upsertStatusLine(base, this.statusLineValue());
@@ -133,13 +139,37 @@ export class ClaudeCliStatuslineAdapter implements TargetAdapter {
       if (!existsSync(bak))
         return { ok: true, restored: false, reason: "no backup present" };
       const saved = readFileSync(bak, "utf8");
-      if (saved === ABSENT) {
-        if (existsSync(this.settings)) rmSync(this.settings);
-      } else {
-        writeFileSync(this.settings, saved, "utf8");
-        if (sha256(readFileSync(this.settings)) !== sha256(Buffer.from(saved, "utf8")))
+      // KEY-SCOPED restore — never a whole-file rollback. The backup is a
+      // point-in-time snapshot from FIRST apply; the user may have edited
+      // settings.json since (hooks, permissions, model config), and any
+      // restore trigger (offline blip → killswitch fail-safe, sign-out,
+      // deactivate) would silently destroy those edits. Instead remove ONLY
+      // the keys we own from the CURRENT file; everything else survives
+      // byte-for-byte (settingsEdit raw-text edits). The snapshot is kept
+      // solely as the ABSENT sentinel: when the file didn't exist before us
+      // and nothing but our keys was ever added, delete the shell we created.
+      if (existsSync(this.settings)) {
+        const cur = readFileSync(this.settings, "utf8");
+        if (!parseable(cur))
+          // User-edited into unparseable JSONC — we can't edit it safely, and
+          // overwriting with the stale snapshot would destroy their edits.
+          // Leave everything (incl. the backup) so a later restore can finish.
           return { ok: false, restored: false,
-                   reason: "sha256 mismatch after restore" };
+                   reason: "settings.json not parseable" };
+        let next = removeTopLevel(cur, "statusLine");
+        next = removeTopLevel(next, "spinnerVerbs");
+        // The shell we created is `{}` plus whitespace; anything else left
+        // (user keys, even bare comments) means the file is now theirs.
+        const emptyShell = /^[\s{}]*$/.test(next);
+        if (saved === ABSENT && emptyShell) {
+          rmSync(this.settings);
+        } else if (next !== cur) {
+          writeFileSync(this.settings, next, "utf8");
+          if (sha256(readFileSync(this.settings))
+              !== sha256(Buffer.from(next, "utf8")))
+            return { ok: false, restored: false,
+                     reason: "sha256 mismatch after restore" };
+        }
       }
       if (existsSync(this.scriptPath())) rmSync(this.scriptPath());
       if (existsSync(this.cachePath())) rmSync(this.cachePath());

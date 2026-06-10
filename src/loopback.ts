@@ -36,6 +36,15 @@ export interface LoopbackMetricPayload {
   viewable?: boolean;
   viewPct?: number;
   viewMs?: number;
+  /** The ad the webview CLAIMS this event belongs to (`ad=` query param on
+   *  the block's metric GETs). For up to one 10s /ad poll after a rotation
+   *  the webview is still running the OLD ad's view sessions, so the host
+   *  must not stamp attribution from its current activeAd (audit #17). The
+   *  deployed block sends the ad TEXT here (its view sessions key on AD);
+   *  hosts resolve either form against their recently-served registry.
+   *  Deliberately NOT named adId: downstream senders spread this payload
+   *  over already-resolved billing fields. */
+  claimedAdId?: string;
 }
 
 export interface LoopbackAdPayload {
@@ -51,7 +60,9 @@ export interface LoopbackHandlers {
   onClick: (clickToken: string,
     surface?: AdSurface,
     visibleMs?: number,
-    eventUuid?: string) => void;
+    eventUuid?: string,
+    /** `ad=` query param — see LoopbackMetricPayload.claimedAdId. */
+    claimedAdId?: string) => void;
   getActivity: () => Record<string, unknown>;
   getCurrentAd: () => LoopbackAdPayload | null;
   /** Optional: every webview-relayed /log POST is mirrored here in addition
@@ -97,7 +108,25 @@ export interface LoopbackStartOpts {
 export class Loopback {
   private server: Server | null = null;
   private token = "";
-  constructor(private readonly h: LoopbackHandlers) {}
+  constructor(private h: LoopbackHandlers) {}
+
+  /** True while the underlying HTTP server is bound and accepting
+   *  connections. Lets bootLoopback() detect a stale shared server (owner
+   *  already stopped) and fall through to a fresh bind. */
+  isRunning(): boolean { return !!this.server && this.server.listening; }
+
+  /** The handler set this instance was constructed with. Read by
+   *  bootLoopback() to lift a later caller's wiring onto the ONE shared
+   *  server (audit #7). */
+  handlers(): LoopbackHandlers { return this.h; }
+
+  /** Live handler swap (audit #7): the request closure dispatches through
+   *  `this.h` at request time, so replacing it re-routes every route —
+   *  /ad, /activity, the metric relays, /click, /log, /test — without
+   *  rebinding the port. Used by bootLoopback() so the production webview
+   *  wiring can take over ad-serving from the debug stub on the single
+   *  shared server instead of EADDRINUSE-ing onto stablePort+1. */
+  setHandlers(h: LoopbackHandlers): void { this.h = h; }
 
   start(opts: LoopbackStartOpts = {}): Promise<{ port: number; token: string }> {
     this.token = opts.token && /^[0-9a-f]{16,}$/i.test(opts.token)
@@ -167,11 +196,15 @@ export class Loopback {
           const visibleMs = Number.isFinite(vmsRaw) && vmsRaw >= 0
             ? Math.floor(vmsRaw) : 0;
           const eventUuid = parseEventUuid(url.searchParams.get("event_uuid"));
+          // Audit #17: lift the claimed ad (when the block sends it) so the
+          // host can bill a click on the OLD ad's anchor — emitted during the
+          // 10s /ad poll lag after a rotation — to the OLD campaign.
+          const claimedAdId = url.searchParams.get("ad") || undefined;
           dlog("ext", "loopback.click", { ct: url.searchParams.get("ct") || "",
             surface: s || "", visibleMs, eventUuid },
             { corr: url.searchParams.get("corr") || "" });
           this.h.onClick(url.searchParams.get("ct") || "", s, visibleMs,
-            eventUuid);
+            eventUuid, claimedAdId);
           res.statusCode = 204;
           res.end(); return;
         }
@@ -289,11 +322,13 @@ function metricPayload(route: string, url: URL): LoopbackMetricPayload {
     : undefined;
   const sessionNonce = url.searchParams.get("session") || undefined;
   const eventUuid = parseEventUuid(url.searchParams.get("event_uuid"));
+  const claimedAdId = url.searchParams.get("ad") || undefined;
   const payload: LoopbackMetricPayload = {};
   if (surface) payload.surface = surface;
   if (typeof visibleMs === "number") payload.visibleMs = visibleMs;
   if (sessionNonce) payload.sessionNonce = sessionNonce;
   if (eventUuid) payload.eventUuid = eventUuid;
+  if (claimedAdId) payload.claimedAdId = claimedAdId;
   if (route === "view_threshold_met" || route === "error_impression") {
     // error_impression is the 5 s safety-net cap from block.asset.js
     // (MAX_SESSION_MS). It represents a session that DID stay visible —

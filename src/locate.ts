@@ -1,6 +1,8 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readdirSync, existsSync, statSync } from "node:fs";
+import { readdirSync, existsSync, statSync, openSync, readSync,
+         closeSync } from "node:fs";
+import { compareClaudeCodeInstall } from "./util/claudeCodeVersion";
 
 // readdir-based glob for `<root>/anthropic.claude-code-*/webview/index.js`.
 // Swapped from `node:fs`'s `globSync` (the installed @types/node@20 lacks the
@@ -31,11 +33,60 @@ export function locateClaudeCode(): string | null {
                        join(homedir(), ".cursor", "extensions"),
                        join(homedir(), ".cursor-server", "extensions")]) {
     try {
-      const hits = globClaudeCode(root).sort();
+      const hits = globClaudeCode(root).sort(compareClaudeCodeInstall);
       if (hits.length) return hits[hits.length - 1];
     } catch { /* ignore */ }
   }
   return null;
+}
+
+/** Best-effort `entrypoint` tag of a session transcript: "claude-vscode" for
+ *  the interactive VS Code panel, "cli" for terminal sessions. Reads the head
+ *  of the file and returns the first record's top-level `entrypoint` string,
+ *  or null when untagged/unreadable (older CC builds; queue-operation lines
+ *  carry no tag, so we scan past them). Line-parsed JSON — a transcript whose
+ *  message TEXT merely quotes `"entrypoint":"cli"` cannot spoof the tag.
+ *  Never throws. */
+export function transcriptEntrypoint(path: string): string | null {
+  const hit = entrypointCache.get(path);
+  if (hit !== undefined) return hit;
+  const tag = readTranscriptEntrypoint(path);
+  if (tag !== null) {
+    if (entrypointCache.size >= ENTRYPOINT_CACHE_MAX) {
+      const oldest = entrypointCache.keys().next().value as string;
+      entrypointCache.delete(oldest);
+    }
+    entrypointCache.set(path, tag);
+  }
+  return tag;
+}
+
+// Per-path tag memo: a transcript's entrypoint tag is written once at session
+// start and never changes, so a TAGGED result is cacheable for the process
+// lifetime — this keeps the repeated locate/cliSessionActive probes (statusbar
+// poll, 60s cliSync tick) from re-reading the same heads. Untagged (null)
+// results are NOT cached: a brand-new session's head may not be flushed yet.
+const entrypointCache = new Map<string, string>();
+const ENTRYPOINT_CACHE_MAX = 256;
+
+function readTranscriptEntrypoint(path: string): string | null {
+  try {
+    const fd = openSync(path, "r");
+    let text: string;
+    try {
+      const buf = Buffer.alloc(16 * 1024);
+      const n = readSync(fd, buf, 0, buf.length, 0);
+      text = buf.toString("utf8", 0, n);
+    } finally { closeSync(fd); }
+    for (const ln of text.split("\n")) {
+      if (!ln) continue;
+      let o: Record<string, unknown>;
+      try { o = JSON.parse(ln) as Record<string, unknown>; }
+      catch { continue; }                  // sliced tail line / junk
+      if (typeof o.entrypoint === "string") return o.entrypoint;
+    }
+    return null;
+  } catch { return null; }
 }
 
 // Discover Claude Code's live JSONL transcript. CRITICAL: multiple Claude
@@ -65,11 +116,21 @@ export function locateClaudeCodeLog(): string {
     }
     if (!cands.length) return "";
     cands.sort((a, b) => b.m - a.m);
-    // NOTE: when multiple Claude Code sessions share a cwd they all live here,
-    // all tagged "claude-vscode", with NO filesystem signal identifying which
-    // belongs to this VS Code window. Newest-mtime is the best available proxy
-    // and is correct for the normal one-session-per-workspace case; it's only
-    // ambiguous when a second (e.g. agent/CLI) session runs in the same repo.
-    return cands[0].p;
+    // Documented filter (audit #24): newest transcript positively tagged
+    // entrypoint:"claude-vscode" wins; fall back to the newest UNTAGGED one
+    // (older CC builds); when every probed candidate is tagged as another
+    // surface (e.g. "cli") return "" — no signal beats a wrong signal (a
+    // terminal session would feed the desync watchdog a false "CC active").
+    // Probes are bounded to the newest few: anything older isn't live.
+    // NOTE: when multiple VS Code sessions share a cwd they're all tagged
+    // "claude-vscode" with NO filesystem signal identifying which belongs to
+    // this window — newest-mtime stays the best available proxy among them.
+    let newestUntagged = "";
+    for (const c of cands.slice(0, 20)) {
+      const tag = transcriptEntrypoint(c.p);
+      if (tag === "claude-vscode") return c.p;
+      if (tag === null && !newestUntagged) newestUntagged = c.p;
+    }
+    return newestUntagged;
   } catch { return ""; }
 }

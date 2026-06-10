@@ -4,7 +4,7 @@ import { Loopback,
   type LoopbackMetricKind, type LoopbackMetricPayload } from "./loopback";
 import { bootLoopback } from "./util/loopbackBoot";
 import { buildLabel, buildVersion, humanAge, BUILD_TS } from "./buildinfo";
-import { dlog, debugEnabled, LOG_PATH } from "./log";
+import { dlog, debugEnabled, debugIconDataUri, LOG_PATH } from "./log";
 import { resolveBannerOn, type BannerOverride } from "./banner";
 import { errMsg } from "./util/errMsg";
 import type { SessionSnapshot } from "./sessionState";
@@ -15,6 +15,7 @@ import {
 } from "./modes";
 import { readFileSync } from "node:fs";
 import { ensureConfigFile } from "./config";
+import { canPatch, canServeAds, clearServingSuspension } from "./servingGate";
 
 /** Auth surface the debug menu needs. Injected post-construction because the
  *  DebugController is built before auth (it must work on incompatible/early-
@@ -213,6 +214,7 @@ export class DebugController {
   /** QuickPick shown when the status bar item is clicked.
    *
    *  Menu shape:
+   *    0. GET PAID OUT $$$ (opens the user's earnings portal — always first)
    *    1. Sign in / Sign out (auth flip; omitted if auth never initialised)
    *    2. Enable / Disable Kickbacks (the renamed toggle)
    *    3. Edit Vibe-Ads config… (opens ~/.vibe-ads/config.json)
@@ -254,6 +256,10 @@ export class DebugController {
         : null;
       const items: ({ id: string; label: string; description?: string;
                      kind?: vscode.QuickPickItemKind })[] = [
+        // Always the very top row — the payout portal is the product's whole
+        // promise, so it outranks even the auth flip.
+        { id: "getpaid", label: "$(credit-card) GET PAID OUT $$$",
+          description: "your earnings portal — kickbacks.ai/me" },
         ...(authItem ? [authItem] : []),
         { id: "toggle",
           label: on ? "$(circle-slash) Disable Kickbacks"
@@ -276,7 +282,10 @@ export class DebugController {
         placeHolder: "Kickbacks",
       }) as { id: string } | undefined;
       if (!pick) return;
-      if (pick.id === "toggle") await this.setOn(!on);
+      if (pick.id === "getpaid")
+        await vscode.env.openExternal(
+          vscode.Uri.parse("https://kickbacks.ai/me"));
+      else if (pick.id === "toggle") await this.setOn(!on);
       else if (pick.id === "config") await this.editConfig();
       else if (pick.id === "restore") await this.doRestore();
       else if (pick.id === "signin")
@@ -346,11 +355,20 @@ export class DebugController {
     // prior value (typically false) and the toast happens once, not
     // per-activation.
     if (on) {
+      // An explicit user enable lifts the crash-canary suspension (wave 2,
+      // audit #14) — this is the "manually re-enable" the canary toast
+      // promises, and the only thing that un-suspends a session.
+      clearServingSuspension();
       const ok = await this._applyAndReport();
       if (!ok) return; // do NOT persist K_ON=true; user can retry manually
       await this.ctx.globalState.update(K_ON, true);
     } else {
       await this.ctx.globalState.update(K_ON, false);
+      // A deliberate disable overrides any remembered sign-out intent: the
+      // serving gate (and the next sign-in's auto-enable) must read this as
+      // "the user opted out", even when a K_PRESIGNOUT=true from an earlier
+      // sign-out is still lying around (wave 2, audit #4).
+      await this.ctx.globalState.update(K_PRESIGNOUT, undefined);
       this.adapter.restore();
       this.restoreCodexDebug();
     }
@@ -390,6 +408,14 @@ export class DebugController {
         dlog("ext", "reapply", { on: false, applied: false, reason: "off" });
         return { on: false, applied: false, reason: "off" };
       }
+      // Serving gate (wave 2): a persisted/confirmed kill, the offline
+      // freeze, or a crash-canary suspension blocks this AUTOMATIC re-apply
+      // (boot canary, sign-in trigger). Manual setOn(true) is not gated.
+      if (!canPatch()) {
+        dlog("ext", "reapply",
+          { on: true, applied: false, reason: "serving-gate" });
+        return { on: true, applied: false, reason: "serving-gate" };
+      }
       await this.apply();
       // apply() reports patch failures via showErrorMessage but does not throw;
       // surface the same signal here for the e2e by re-checking didn't throw.
@@ -417,6 +443,9 @@ export class DebugController {
   cyclePatch(): { ok: boolean; reason?: string } {
     try {
       if (!this.on()) return { ok: false, reason: "off" };
+      // Serving gate (wave 2): the boot-time cycle and the desync watchdog
+      // must never restore+re-patch a killed / frozen / suspended install.
+      if (!canPatch()) return { ok: false, reason: "serving-gate" };
       if (!this.lastApplyParams)
         return { ok: false, reason: "no-params" };
       // Sync restore (rename backup → main) then sync applyPatch
@@ -453,6 +482,10 @@ export class DebugController {
   async reassertTick(): Promise<void> {
     try {
       if (!this.on()) return;
+      // Serving gate (wave 2, audit #6): pre-fix this unconditional 60s tick
+      // re-patched a killed install right after checkKill restored it — the
+      // restore→re-patch oscillation. Killed/offline/suspended ⇒ no writes.
+      if (!canPatch()) return;
       // Healthy only when CC AND (no Codex install | Codex also patched) —
       // so a Codex-only drift (CC fine) still self-heals via apply().
       const ccOk = this.adapter.isPatched?.() === true;
@@ -472,6 +505,11 @@ export class DebugController {
     const r = this.adapter.restore();
     this.restoreCodexDebug();
     await this.ctx.globalState.update(K_ON, false);
+    // A menu "Restore Claude Code" is a deliberate disable, same as
+    // setOn(false): clear the sign-out memory too, or a stale
+    // K_PRESIGNOUT=true keeps the serving gate's enabled() input true and
+    // the 60s reassert re-patches the just-restored install within a minute.
+    await this.ctx.globalState.update(K_PRESIGNOUT, undefined);
     this.onState(false);
     vscode.window.showInformationMessage(
       r.restored ? "Kickbacks: Claude Code restored."
@@ -499,10 +537,13 @@ export class DebugController {
   }
 
   private async apply(): Promise<boolean> {
-    // Fresh loopback per apply so click/activity routes stay valid; stop any
-    // prior debug server first to avoid leaking listeners.
-    if (this.lb) await this.lb.stop();
-    this.lb = new Loopback({
+    // ONE Loopback per controller lifetime (audit #7). Pre-fix every apply()
+    // stopped + re-minted a fresh server; under the shared-server boot (see
+    // bootLoopback) that re-mint would tear down the single server the
+    // production webview traffic runs on. The handlers close over instance
+    // fields (metricsSender / portfolioAd), so reuse keeps every route live
+    // across applies, and the stable token+port keep baked URLs valid.
+    if (!this.lb) this.lb = new Loopback({
       // Forward impression / view / view-threshold events to the real
       // ledger so debug-mode traffic is indistinguishable from a served
       // ad. The sender closure (wired by extension.ts) handles
@@ -531,16 +572,27 @@ export class DebugController {
         });
       },
       getActivity: () => ({}),
-      getCurrentAd: () => this.portfolioAd
+      // Gate /ad (wave 2, audit #3): a confirmed kill or a deliberate
+      // disable stops handing out ads — live webviews see the same empty
+      // payload as the no-inventory state and drop their overlays within
+      // one 10s poll. /activity and /log relay stay untouched.
+      getCurrentAd: () => canServeAds() && this.portfolioAd
         ? { adText: this.portfolioAd.text, clickUrl: this.portfolioAd.clickUrl,
-            iconUrl: "", adId: "", campaignId: "" }
+            // Icon-less by default; the e2e icon override (data: URI only)
+            // lets the closed-loop harness screenshot-verify the custom-icon
+            // surface. Empty in production -> "K" fallback, unchanged.
+            iconUrl: debugIconDataUri(), adId: "", campaignId: "" }
         : null,
     });
-    // Reuse the persistent token + preferred port the production
-    // path stored in globalState. See bootLoopback() for details.
-    const { port, token, base: lbBase } = await bootLoopback(this.lb, this.ctx);
+    // Reuse the persistent token + preferred port stored in globalState, and
+    // register SECONDARY (audit #7): when the production loopback is (or
+    // later comes) up, this returns the SAME shared server/port instead of
+    // EADDRINUSE-ing onto stablePort+1, and the debug stub's handlers never
+    // displace the production wiring. See bootLoopback() for details.
+    const { port, token, base: lbBase } =
+      await bootLoopback(this.lb, this.ctx, { secondary: true });
     const params: PatchParams = {
-      tier: 3, adText: this.text(), iconRef: "", iconUrl: "",
+      tier: 3, adText: this.text(), iconRef: "", iconUrl: debugIconDataUri(),
       clickToken: "debug", clickUrl: this.portfolioAd?.clickUrl || DEFAULT_CLICK, corr: "debug." + token.slice(0, 6),
       loopbackPort: port,
       loopbackToken: token, loopbackBase: lbBase, debug: debugEnabled(),

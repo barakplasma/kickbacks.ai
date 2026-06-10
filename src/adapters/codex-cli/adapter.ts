@@ -9,6 +9,14 @@ import { resolveAsset } from "../../util/asset";
 const MARKER = "VIBE-ADS-CODEX-CLI";
 const AD_FILE_NAME = "codex-cli-ad.txt";
 
+/** Terminal esc()-analog: strip control chars (C0 + DEL + C1) — and ONLY
+ *  those — before the wrappers printf/echo the ad text raw to a terminal.
+ *  Emoji / pipes / unicode / URLs pass through untouched (permissive by
+ *  design — see backend validate_creative_fields, same char class). */
+function stripControlChars(s: string): string {
+  return s.replace(/[\x00-\x1f\x7f-\x9f]/g, "");
+}
+
 /** Resolve the wrapper asset in BOTH unbundled (co-located src) and
  *  esbuild-bundled (dist/adapters/codex-cli/) layouts — mirrors the
  *  CLI status-line adapter's resolveStatuslineAsset contract. */
@@ -105,8 +113,12 @@ export class CodexCliWrapperAdapter implements TargetAdapter {
       // so an ad change does NOT require a wrapper rewrite — the wrapper
       // re-reads this file on every codex invocation.
       mkdirSync(this.vibeDir(), { recursive: true });
+      // Control chars are stripped here (the shell/batch wrappers print the
+      // file raw and cannot sanitize); an adText that strips to empty falls
+      // back to the default line rather than printing a blank banner.
       writeFileSync(this.adFilePath(),
-        (p.adText || "Earning Kickback") + "\n", "utf8");
+        (stripControlChars(p.adText || "") || "Earning Kickback") + "\n",
+        "utf8");
       // Idempotent: if the shim already carries our marker, no wrapper rewrite.
       const current = readFileSync(this.shim, "utf8");
       if (current.includes(MARKER)) return { ok: true };

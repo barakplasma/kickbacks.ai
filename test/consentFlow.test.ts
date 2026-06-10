@@ -9,6 +9,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { activate, deactivate, __wireForTest } from "../src/extension";
+import { ConsentClient } from "../src/consent/client";
 import { makeContext, secrets, _opened, _shown, _openedDocs, commands, window }
   from "./mocks/vscode";
 
@@ -173,4 +174,29 @@ describe("consent flow — activate() wires maybePromptForConsent end-to-end", (
         try { rmSync(home, { recursive: true, force: true }); } catch { /* ok */ }
       }
     });
+});
+
+// audit-2026-06-09 #38: ConsentClient was the only client whose DEFAULT was
+// bare `fetch` (no timeout) — the 2A-01 black-holed-connection hang class.
+// Pin that the default-constructed client (the extension.ts wiring passes no
+// fetch) sends every request with an AbortSignal.
+describe("ConsentClient default fetch carries a timeout (audit #38)", () => {
+  it("GET and POST both carry an abort signal", async () => {
+    const inits: (RequestInit | undefined)[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init?: RequestInit) => {
+      inits.push(init);
+      return { ok: true, status: 200, json: async () => ({
+        telemetry_opt_in: false, tos_accepted_version: "v1",
+        current_tos_version: "v2",
+        tos_version: "v2", accepted_at: "2026-01-01T00:00:00Z",
+      }) } as Response;
+    }));
+    const c = new ConsentClient("http://x", () => "tok");
+    expect(await c.read()).not.toBeNull();
+    expect(await c.accept()).not.toBeNull();
+    expect(inits).toHaveLength(2);
+    // Pre-fix: the default was bare fetch -> no signal on either call.
+    expect(inits[0]?.signal).toBeInstanceOf(AbortSignal);
+    expect(inits[1]?.signal).toBeInstanceOf(AbortSignal);
+  });
 });
