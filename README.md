@@ -1,11 +1,5 @@
 <div align="center">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="media/logos/kickbacks-white.svg">
-  <source media="(prefers-color-scheme: light)" srcset="media/logos/kickbacks-green.svg">
-  <img alt="Kickbacks" src="media/logos/kickbacks.svg" width="320">
-</picture>
-
 ### Get paid while you code.
 
 **Kickbacks** sells the little "thinking…" word inside the Claude Code & Codex
@@ -14,8 +8,6 @@ machine showed it.
 
 [![Website](https://img.shields.io/badge/kickbacks.ai-00B894?style=for-the-badge&logoColor=white)](https://kickbacks.ai)
 [![VS Code Marketplace](https://img.shields.io/badge/VS%20Code-Install-007ACC?style=for-the-badge&logo=visualstudiocode&logoColor=white)](https://marketplace.visualstudio.com/items?itemName=Kickbacksai.kickbacks-ai)
-[![License](https://img.shields.io/badge/license-Source--Available-lightgrey?style=for-the-badge)](LICENSE)
-
 </div>
 
 ---
